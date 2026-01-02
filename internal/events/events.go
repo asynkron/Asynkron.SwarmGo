@@ -12,6 +12,7 @@ type AgentAdded struct {
 	Model    string
 	LogPath  string
 	Worktree string
+	Running  bool
 }
 
 type AgentRemoved struct{ ID string }

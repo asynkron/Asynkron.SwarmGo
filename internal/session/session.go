@@ -100,6 +100,11 @@ func (s *Session) AppLogPath() string {
 	return filepath.Join(s.Path, "app.log")
 }
 
+// UserCommandLogPath returns the log file path for the user command agent.
+func (s *Session) UserCommandLogPath() string {
+	return filepath.Join(s.Path, "user-command.log")
+}
+
 // CodedSupervisorPath returns the aggregated supervisor JSON path.
 func (s *Session) CodedSupervisorPath() string {
 	return filepath.Join(s.Path, "coded-supervisor.json")

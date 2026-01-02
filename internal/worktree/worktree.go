@@ -11,6 +11,11 @@ import (
 
 // Create prepares git worktrees rooted at repoPath pointing to HEAD.
 func Create(ctx context.Context, repoPath string, worktreePaths []string) error {
+	return CreateFromRef(ctx, repoPath, worktreePaths, "HEAD")
+}
+
+// CreateFromRef prepares git worktrees rooted at repoPath pointing to the given ref.
+func CreateFromRef(ctx context.Context, repoPath string, worktreePaths []string, ref string) error {
 	repoPath, _ = filepath.Abs(repoPath)
 
 	if err := runGit(ctx, repoPath, "worktree", "prune"); err != nil {
@@ -21,7 +26,7 @@ func Create(ctx context.Context, repoPath string, worktreePaths []string) error 
 		if _, err := os.Stat(wt); err == nil {
 			_ = Remove(ctx, repoPath, wt)
 		}
-		if err := runGit(ctx, repoPath, "worktree", "add", "--detach", wt, "HEAD"); err != nil {
+		if err := runGit(ctx, repoPath, "worktree", "add", "--detach", wt, ref); err != nil {
 			return fmt.Errorf("create worktree %s: %w", wt, err)
 		}
 	}

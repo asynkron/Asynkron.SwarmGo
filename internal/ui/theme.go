@@ -26,6 +26,6 @@ func defaultTheme() theme {
 		error:   lipgloss.Color("#e06c75"),
 		say:     lipgloss.Color("#abb2bf"),
 		do:      lipgloss.Color("#5c6370"),
-		see:     lipgloss.Color("#4b5263"),
+		see:     lipgloss.Color("#7f848e"),
 	}
 }

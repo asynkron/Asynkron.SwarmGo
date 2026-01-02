@@ -110,6 +110,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		Model:    display,
 		LogPath:  a.LogPath,
 		Worktree: a.Workdir,
+		Running:  true,
 	}
 	a.emit(added)
 	// Log the add to help debug missing agents in the UI.

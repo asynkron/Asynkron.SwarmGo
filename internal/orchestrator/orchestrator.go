@@ -36,6 +36,7 @@ type Orchestrator struct {
 	appLog          *appLogger
 	workerSpecs     map[string]workerSpec
 	supervisorSpec  *supervisorSpec
+	userSpec        *userCommandSpec
 	agentRestarts   map[string]int
 }
 
@@ -76,6 +77,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			Model:    "",
 			LogPath:  o.session.AppLogPath(),
 			Worktree: o.session.Path,
+			Running:  true,
 		})
 		o.logf("orchestrator starting (resume=%v)", o.resume)
 	} else {
@@ -159,6 +161,32 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.logf("supervisor start failed: %v", err)
 		return err
 	}
+
+	userCLI := agents.NewCLI(o.opts.Supervisor)
+	userLog := o.session.UserCommandLogPath()
+	_, userDisplay := userCLI.Model(len(worktrees) + 2)
+	if sm, ok := userCLI.(agents.SupervisorModeler); ok {
+		_, userDisplay = sm.SupervisorModel()
+	}
+	o.userSpec = &userCommandSpec{
+		worktrees:    worktrees,
+		repoPath:     o.opts.Repo,
+		cli:          userCLI,
+		logPath:      userLog,
+		ghAvailable:  ghAvailable,
+		isGitHubRepo: isGitHubRepo,
+	}
+	o.agentRestarts["user-command"] = 0
+	o.emit(events.AgentAdded{
+		ID:       "user-command",
+		Name:     "User Command",
+		Kind:     userCLI.Name(),
+		Model:    userDisplay,
+		LogPath:  userLog,
+		Worktree: o.opts.Repo,
+		Running:  false,
+	})
+	o.emit(events.StatusMessage{Message: "User command agent is stopped; press Enter to inject a prompt or Space to start/stop."})
 	o.emit(events.PhaseChanged{Phase: "Workers running..."})
 
 	// Tick remaining time
@@ -256,6 +284,7 @@ func (o *Orchestrator) startWorkers(ctx context.Context, worktrees []string, wor
 			Model:    display,
 			LogPath:  logPath,
 			Worktree: worktrees[i],
+			Running:  true,
 		})
 		worker := agents.NewWorker(i, worktrees[i], o.opts.Todo, cli, logPath, o.opts.Autopilot, branchName, restartCount, ghAvailable, isGitHubRepo, o.events)
 		if err := worker.Start(ctx); err != nil {
@@ -311,6 +340,7 @@ func (o *Orchestrator) startSupervisor(ctx context.Context, worktrees, workerLog
 		Model:    display,
 		LogPath:  o.session.SupervisorLogPath(),
 		Worktree: o.opts.Repo,
+		Running:  true,
 	})
 	supervisor := agents.NewSupervisor(worktrees, workerLogs, o.opts.Repo, o.session.CodedSupervisorPath(), cli, o.session.SupervisorLogPath(), o.opts.Autopilot, restartCount, ghAvailable, isGitHubRepo, o.events)
 	if err := supervisor.Start(ctx); err != nil {
@@ -366,6 +396,8 @@ func (o *Orchestrator) handleControl(ctx context.Context, cmd control.Command) e
 		return o.stopAgent(c.AgentID)
 	case control.StartAgent:
 		return o.restartAgent(ctx, c.AgentID, "")
+	case control.StartUserCommand:
+		return o.restartAgent(ctx, "user-command", c.Message)
 	default:
 		return fmt.Errorf("unknown control command %T", cmd)
 	}
@@ -375,32 +407,32 @@ func (o *Orchestrator) restartAgent(ctx context.Context, id string, message stri
 	o.logf("control: restarting %s with injected message length=%d", id, len(message))
 	o.mu.Lock()
 	var target *agents.Agent
+	var remaining []*agents.Agent
 	for _, a := range o.agents {
 		if a.ID == id {
 			target = a
-			break
+			continue
 		}
-	}
-	// Remove target from list to prevent duplicate tracking.
-	var remaining []*agents.Agent
-	for _, a := range o.agents {
-		if a.ID != id {
-			remaining = append(remaining, a)
-		}
+		remaining = append(remaining, a)
 	}
 	o.agents = remaining
 	o.mu.Unlock()
-	if target == nil {
-		return fmt.Errorf("agent %s not found", id)
-	}
 
-	target.Stop()
+	if target != nil {
+		target.Stop()
+	}
 
 	if spec, ok := o.workerSpecs[id]; ok {
 		return o.restartWorker(ctx, id, spec, message)
 	}
 	if o.supervisorSpec != nil && id == "supervisor" {
 		return o.restartSupervisor(ctx, id, message)
+	}
+	if o.userSpec != nil && id == "user-command" {
+		return o.restartUserCommand(ctx, id, message)
+	}
+	if target == nil {
+		return fmt.Errorf("agent %s not found", id)
 	}
 	return fmt.Errorf("no restart spec for %s", id)
 }
@@ -654,6 +686,15 @@ type supervisorSpec struct {
 	restartCount int
 }
 
+type userCommandSpec struct {
+	worktrees    []string
+	repoPath     string
+	cli          agents.CLI
+	logPath      string
+	ghAvailable  bool
+	isGitHubRepo bool
+}
+
 func (o *Orchestrator) restartWorker(ctx context.Context, id string, spec workerSpec, message string) error {
 	restartCount := o.agentRestarts[id] + 1
 	prompt := prompts.WorkerPrompt(spec.todoFile, fmt.Sprintf("Worker %d", spec.index+1), spec.autopilot, spec.branchName, spec.logPath, restartCount, spec.ghAvailable, spec.isGitHubRepo)
@@ -674,6 +715,7 @@ func (o *Orchestrator) restartWorker(ctx context.Context, id string, spec worker
 		Model:    display,
 		LogPath:  spec.logPath,
 		Worktree: spec.worktree,
+		Running:  true,
 	})
 
 	o.mu.Lock()
@@ -712,6 +754,7 @@ func (o *Orchestrator) restartSupervisor(ctx context.Context, id string, message
 		Model:    display,
 		LogPath:  spec.logPath,
 		Worktree: spec.repoPath,
+		Running:  true,
 	})
 
 	o.mu.Lock()
@@ -720,5 +763,27 @@ func (o *Orchestrator) restartSupervisor(ctx context.Context, id string, message
 	o.mu.Unlock()
 	o.logf("restarted supervisor (restartCount=%d)", restartCount)
 	o.emit(events.StatusMessage{Message: "Restarted supervisor with injected note"})
+	return nil
+}
+
+func (o *Orchestrator) restartUserCommand(ctx context.Context, id string, message string) error {
+	if o.userSpec == nil {
+		return fmt.Errorf("no user command spec to start")
+	}
+	startCount := o.agentRestarts[id] + 1
+	agent := agents.NewUserCommand(o.userSpec.worktrees, o.userSpec.repoPath, o.userSpec.cli, o.userSpec.logPath, message, o.events)
+	if err := agent.Start(ctx); err != nil {
+		return fmt.Errorf("start %s: %w", id, err)
+	}
+	o.mu.Lock()
+	o.agents = append(o.agents, agent)
+	o.agentRestarts[id] = startCount
+	o.mu.Unlock()
+	o.logf("started user command (starts=%d messageLen=%d)", startCount, len(message))
+	if strings.TrimSpace(message) == "" {
+		o.emit(events.StatusMessage{Message: "Started user command agent"})
+	} else {
+		o.emit(events.StatusMessage{Message: "Started user command with injected note"})
+	}
 	return nil
 }

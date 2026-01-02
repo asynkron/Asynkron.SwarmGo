@@ -271,7 +271,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 		if m.scrollBottom {
 			if len(m.itemOrder) > 0 && m.selected < len(m.itemOrder) {
-				if id := m.itemOrder[m.selected]; strings.HasPrefix(id, "worker") || id == "prep" || id == "supervisor" {
+				if id := m.itemOrder[m.selected]; id != "session" && id != "todo" && id != "coded" {
 					m.view.GotoBottom()
 				}
 			}
@@ -316,12 +316,13 @@ func (m Model) View() string {
 func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 	switch e := ev.(type) {
 	case events.AgentAdded:
+		running := e.Running
 		if ag, exists := m.agents[e.ID]; exists {
 			ag.Name = e.Name
 			ag.Kind = e.Kind
 			ag.Model = e.Model
 			ag.LogPath = e.LogPath
-			ag.Running = true
+			ag.Running = running
 		} else {
 			m.agents[e.ID] = &agentView{
 				ID:      e.ID,
@@ -329,11 +330,15 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 				Kind:    e.Kind,
 				Model:   e.Model,
 				LogPath: e.LogPath,
-				Running: true,
+				Running: running,
 			}
 			m.itemOrder = append(m.itemOrder, e.ID)
 		}
-		m.status = append(m.status, fmt.Sprintf("Started %s (%s)", e.Name, e.Kind))
+		status := "Started"
+		if !running {
+			status = "Ready"
+		}
+		m.status = append(m.status, fmt.Sprintf("%s %s (%s)", status, e.Name, e.Kind))
 		m.ensureLog(e.ID)
 		m.updateViewport()
 	case events.AgentRemoved:
@@ -460,7 +465,7 @@ func (m *Model) updateViewport() {
 	}
 	m.clampViewport()
 	// Always jump to bottom when switching selection to match log tail expectation.
-	if strings.HasPrefix(id, "worker") || id == "prep" || id == "supervisor" {
+	if id != "session" && id != "todo" && id != "coded" {
 		m.view.GotoBottom()
 	}
 }

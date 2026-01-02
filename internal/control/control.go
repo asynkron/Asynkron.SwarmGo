@@ -20,3 +20,10 @@ func (StopAgent) isCommand() {}
 type StartAgent struct{ AgentID string }
 
 func (StartAgent) isCommand() {}
+
+// StartUserCommand starts the one-off user agent with a specific prompt.
+type StartUserCommand struct {
+	Message string
+}
+
+func (StartUserCommand) isCommand() {}

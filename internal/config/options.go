@@ -22,6 +22,7 @@ type Options struct {
 	Arena      bool
 	Autopilot  bool
 	Supervisor AgentType
+	PrepAgent  AgentType
 
 	Resume     string
 	Detect     bool
@@ -60,6 +61,10 @@ func (o *Options) Validate() error {
 	if o.ClaudeWorkers+o.CodexWorkers+o.CopilotWorkers+o.GeminiWorkers == 0 {
 		// Default to two Claude workers when nothing is specified.
 		o.ClaudeWorkers = 2
+	}
+
+	if o.PrepAgent == "" {
+		o.PrepAgent = AgentClaude
 	}
 
 	if o.Repo == "" {
