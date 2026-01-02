@@ -288,6 +288,7 @@ func (m *Model) updateViewport() {
 	default:
 		if buf, ok := m.logs[id]; ok {
 			m.view.SetContent(style.Render(m.renderAgentLog(buf)))
+			m.view.GotoBottom()
 		} else {
 			m.view.SetContent(style.Render("waiting for output..."))
 		}
