@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -218,7 +219,7 @@ func (m *Model) updateViewport() {
 		content := m.renderSessionInfo()
 		m.view.SetContent(content)
 	case "todo":
-		m.view.SetContent(m.todo)
+		m.view.SetContent(m.loadTodoContent())
 	default:
 		if buf, ok := m.logs[id]; ok {
 			m.view.SetContent(buf.content())
@@ -363,6 +364,23 @@ func (b *logBuffer) append(line string) {
 
 func (b *logBuffer) content() string {
 	return strings.Join(b.lines, "\n")
+}
+
+func (m *Model) loadTodoContent() string {
+	// Prefer live read from disk so updates show without a restart.
+	path := m.todoPath
+	if path == "" {
+		path = fmt.Sprintf("%s/%s", m.session.Path, m.opts.Todo)
+	}
+	if m.opts.Repo != "" {
+		path = fmt.Sprintf("%s/%s", strings.TrimRight(m.opts.Repo, "/"), m.opts.Todo)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("todo not found: %s (%v)", path, err)
+	}
+	return string(content)
 }
 
 func waitForEvent(ch <-chan events.Event) tea.Cmd {
