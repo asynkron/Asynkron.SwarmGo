@@ -77,12 +77,13 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 		session:      sess,
 		opts:         opts,
 		events:       events,
-		itemOrder:    []string{"session", "todo"},
+		itemOrder:    []string{"session", "todo", "coded"},
 		agents:       make(map[string]*agentView),
 		logs:         make(map[string]*logBuffer),
 		view:         view,
 		styles:       defaultTheme(),
-		mouseEnabled: false,
+		mouseEnabled: true,
+		hasCoded:     true,
 	}
 	// Default to showing the todo panel first so something useful is visible.
 	if len(m.itemOrder) > 1 {
@@ -98,7 +99,7 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitForEvent(m.events), tea.DisableMouse)
+	return tea.Batch(waitForEvent(m.events), tea.EnableMouseCellMotion)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -260,6 +261,9 @@ func (m *Model) ensureLog(id string) *logBuffer {
 
 func (m *Model) rebuildOrder() {
 	order := []string{"session", "todo"}
+	if m.hasCoded {
+		order = append(order, "coded")
+	}
 	for id := range m.agents {
 		order = append(order, id)
 	}
