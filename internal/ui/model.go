@@ -456,6 +456,10 @@ func (m *Model) updateViewport() {
 		}
 	}
 	m.clampViewport()
+	// Always jump to bottom when switching selection to match log tail expectation.
+	if strings.HasPrefix(id, "worker") || id == "prep" || id == "supervisor" {
+		m.view.GotoBottom()
+	}
 }
 
 func (m Model) renderHeader() string {
