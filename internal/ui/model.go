@@ -40,6 +40,7 @@ type Model struct {
 	mdWidth      int
 	listWidth    int
 	mouseOverLog bool
+	mouseEnabled bool
 }
 
 type agentView struct {
@@ -71,14 +72,15 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 	view.MouseWheelEnabled = true
 
 	m := Model{
-		session:   sess,
-		opts:      opts,
-		events:    events,
-		itemOrder: []string{"session", "todo"},
-		agents:    make(map[string]*agentView),
-		logs:      make(map[string]*logBuffer),
-		view:      view,
-		styles:    defaultTheme(),
+		session:      sess,
+		opts:         opts,
+		events:       events,
+		itemOrder:    []string{"session", "todo"},
+		agents:       make(map[string]*agentView),
+		logs:         make(map[string]*logBuffer),
+		view:         view,
+		styles:       defaultTheme(),
+		mouseEnabled: true,
 	}
 	// Default to showing the todo panel first so something useful is visible.
 	if len(m.itemOrder) > 1 {
@@ -106,6 +108,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.resize()
 	case tea.MouseMsg:
+		if !m.mouseEnabled {
+			break
+		}
 		m.mouseOverLog = msg.X > m.listWidth
 		switch msg.Type {
 		case tea.MouseWheelUp:
@@ -152,6 +157,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.view.LineUp(10)
 		case "pgdown":
 			m.view.LineDown(10)
+		case "m":
+			m.mouseEnabled = !m.mouseEnabled
+			if m.mouseEnabled {
+				cmds := []tea.Cmd{tea.EnableMouseCellMotion, waitForEvent(m.events)}
+				return m, tea.Batch(cmds...)
+			}
+			cmds := []tea.Cmd{tea.DisableMouse, waitForEvent(m.events)}
+			return m, tea.Batch(cmds...)
 		}
 	case events.Event:
 		m = m.handleEvent(msg)
