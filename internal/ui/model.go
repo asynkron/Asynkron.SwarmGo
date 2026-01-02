@@ -314,18 +314,34 @@ func (m Model) renderRow(name, meta string, selected bool, prefix string) string
 }
 
 func (m Model) renderLog() string {
-	header := "Log"
-	if m.selected < len(m.itemOrder) {
-		header = title(m.itemOrder[m.selected])
+	if len(m.itemOrder) == 0 {
+		return ""
 	}
+
+	selectedID := m.itemOrder[m.selected]
+	header := title(selectedID)
+
+	// Special-case todo so it always renders from disk, even if viewport glitches.
+	if selectedID == "todo" {
+		content := m.loadTodoContent()
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(m.styles.border).
+			Padding(0, 1).
+			Width(m.view.Width + 2).
+			Height(m.view.Height + 2)
+		body := lipgloss.NewStyle().Width(m.view.Width).Render(content)
+		return box.Render(header + "\n" + body)
+	}
+
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.styles.border).
 		Padding(0, 1).
 		Width(m.view.Width + 2).
 		Height(m.view.Height + 2)
-	content := lipgloss.NewStyle().Height(m.view.Height).Render(m.view.View())
-	return box.Render(header + "\n" + content)
+	body := lipgloss.NewStyle().Height(m.view.Height).Render(m.view.View())
+	return box.Render(header + "\n" + body)
 }
 
 func (m Model) renderSessionInfo() string {
