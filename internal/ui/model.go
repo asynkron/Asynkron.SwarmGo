@@ -82,7 +82,7 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 		logs:         make(map[string]*logBuffer),
 		view:         view,
 		styles:       defaultTheme(),
-		mouseEnabled: true,
+		mouseEnabled: false,
 	}
 	// Default to showing the todo panel first so something useful is visible.
 	if len(m.itemOrder) > 1 {
@@ -98,7 +98,7 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitForEvent(m.events))
+	return tea.Batch(waitForEvent(m.events), tea.DisableMouse)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -352,7 +352,7 @@ func (m Model) renderList() string {
 		case "todo":
 			rows = append(rows, m.renderRow("Todo", m.opts.Todo, selected, ""))
 		case "coded":
-			rows = append(rows, m.renderRow("Coded Supervisor", filepath.Base(m.session.CodedSupervisorPath()), selected, ""))
+			rows = append(rows, m.renderRow("Metrics", filepath.Base(m.session.CodedSupervisorPath()), selected, ""))
 		default:
 			ag := m.agents[id]
 			var state string
