@@ -41,6 +41,7 @@ go run ./cmd/swarm --detect
 - `q` quit
 
 ## Notes and differences from the .NET version
-- Resume and full arena orchestration are not yet implemented.
+- Arena multi-round orchestration is not yet implemented.
+- Resume uses the session folders under your temp dir (`/tmp/swarmgo/<session>`). Pass `--resume <SESSION_ID>` to restart a previous run and continue tailing its existing logs.
 - Agent detection is lightweight (PATH + `--version`); no prompt test is executed.
 - Worktrees and session data live under your system temp directory (`/tmp/swarmgo/<session>`).

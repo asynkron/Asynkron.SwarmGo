@@ -6,13 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/asynkron/Asynkron.SwarmGo/internal/config"
+	"github.com/asynkron/Asynkron.SwarmGo/internal/control"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/events"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/session"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -24,6 +27,7 @@ type Model struct {
 	session *session.Session
 	opts    config.Options
 	events  <-chan events.Event
+	control chan<- control.Command
 
 	width        int
 	height       int
@@ -40,12 +44,19 @@ type Model struct {
 	spinner      spinner.Model
 	ready        bool
 	styles       theme
-	mdRenderer   *glamour.TermRenderer
-	mdWidth      int
 	listWidth    int
 	mouseOverLog bool
 	mouseEnabled bool
 	hasCoded     bool
+	eventsClosed bool
+	pendingView  bool
+	scrollBottom bool
+	mdRenderer   *glamour.TermRenderer
+	mdMu         sync.Mutex
+	todoCache    todoCache
+	inputActive  bool
+	inputField   textarea.Model
+	inputTarget  string
 }
 
 type agentView struct {
@@ -62,22 +73,50 @@ type agentView struct {
 type logBuffer struct {
 	lines []logEntry
 	limit int
+	// cached rendered content to avoid re-rendering large logs on every selection
+	rendered string
+	dirty    bool
+	doMode   bool
+}
+
+type todoCache struct {
+	path     string
+	modTime  time.Time
+	width    int
+	rendered string
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+const (
+	logBufferLimit        = 300
+	markdownRenderTimeout = 75 * time.Millisecond
+	markdownRenderBudget  = 150 * time.Millisecond
+)
+
 type logEntry struct {
 	Kind events.AgentMessageKind
 	Text string
+	// cached render to avoid re-rendering on scroll
+	rendered       string
+	renderMarkdown bool
 }
 
 // New returns a ready-to-run UI model.
-func New(sess *session.Session, opts config.Options, events <-chan events.Event) Model {
+func New(sess *session.Session, opts config.Options, events <-chan events.Event, control chan<- control.Command) Model {
 	view := viewport.New(80, 20)
 	view.MouseWheelEnabled = true
 	theme := defaultTheme()
 	sp := spinner.New()
 	sp.Style = lipgloss.NewStyle().Foreground(theme.accent)
+
+	ti := textarea.New()
+	ti.Prompt = ""
+	ti.Placeholder = "Enter note (Enter=send, Alt+Enter=newline, Esc=cancel)"
+	ti.SetWidth(view.Width)
+	ti.SetHeight(5)
+	ti.ShowLineNumbers = false
+	ti.Focus()
 
 	m := Model{
 		session:      sess,
@@ -91,6 +130,8 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event)
 		mouseEnabled: true,
 		hasCoded:     true,
 		spinner:      sp,
+		control:      control,
+		inputField:   ti,
 	}
 	// Default to showing the todo panel first so something useful is visible.
 	if len(m.itemOrder) > 1 {
@@ -111,6 +152,7 @@ func (m Model) Init() tea.Cmd {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	skipViewport := false
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -150,23 +192,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			skipViewport = true
 		}
 	case tea.KeyMsg:
+		if m.inputActive {
+			switch {
+			case msg.Type == tea.KeyEsc:
+				m.inputActive = false
+				m.inputTarget = ""
+				m.inputField.Reset()
+				return m, nil
+			case msg.Type == tea.KeyEnter && msg.Alt:
+				m.inputField.SetValue(m.inputField.Value() + "\n")
+				return m, nil
+			case msg.Type == tea.KeyEnter:
+				target := m.inputTarget
+				value := m.inputField.Value()
+				m.inputActive = false
+				m.inputTarget = ""
+				m.inputField.Reset()
+				if target != "" && m.control != nil {
+					go func() { m.control <- control.RestartAgent{AgentID: target, Message: value} }()
+					m.status = append(m.status, fmt.Sprintf("Restart requested for %s", target))
+					m.trimStatus()
+				}
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.inputField, cmd = m.inputField.Update(msg)
+			return m, cmd
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
-				m.updateViewport()
+				skipViewport = true
 			}
 		case "down", "j":
 			if m.selected < len(m.itemOrder)-1 {
 				m.selected++
-				m.updateViewport()
+				skipViewport = true
 			}
 		case "pgup":
 			m.view.LineUp(10)
 		case "pgdown":
 			m.view.LineDown(10)
+		case "enter":
+			m.startInjectPrompt()
 		case "m":
 			m.mouseEnabled = !m.mouseEnabled
 			if m.mouseEnabled {
@@ -177,18 +248,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 	case events.Event:
-		m = m.handleEvent(msg)
+		var ecmd tea.Cmd
+		m, ecmd = m.handleEvent(msg)
+		if ecmd != nil {
+			cmds = append(cmds, ecmd)
+		}
+	case eventsClosedMsg:
+		m.eventsClosed = true
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		if m.anyPendingDo() {
+			m.markDoBuffersDirty()
+			m.updateViewport()
+		}
 		return m, cmd
+	case viewportUpdateMsg:
+		m.pendingView = false
+		m.updateViewport()
+		if m.scrollBottom {
+			if len(m.itemOrder) > 0 && m.selected < len(m.itemOrder) {
+				if id := m.itemOrder[m.selected]; strings.HasPrefix(id, "worker") || id == "prep" || id == "supervisor" {
+					m.view.GotoBottom()
+				}
+			}
+			m.scrollBottom = false
+		}
 	}
 
-	cmds := []tea.Cmd{waitForEvent(m.events)}
+	if !m.eventsClosed {
+		cmds = append(cmds, waitForEvent(m.events))
+	}
 	var cmd tea.Cmd
 	if !skipViewport {
 		m.view, cmd = m.view.Update(msg)
 		cmds = append(cmds, cmd)
+	}
+	if skipViewport {
+		if c := m.requestViewportUpdate(); c != nil {
+			cmds = append(cmds, c)
+		}
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -205,21 +304,32 @@ func (m Model) View() string {
 	status := m.renderStatus()
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, list, log)
+	if m.inputActive {
+		body = lipgloss.JoinHorizontal(lipgloss.Top, list, m.renderInputOverlay())
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 }
 
-func (m *Model) handleEvent(ev events.Event) Model {
+func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 	switch e := ev.(type) {
 	case events.AgentAdded:
-		m.agents[e.ID] = &agentView{
-			ID:      e.ID,
-			Name:    e.Name,
-			Kind:    e.Kind,
-			Model:   e.Model,
-			LogPath: e.LogPath,
-			Running: true,
+		if ag, exists := m.agents[e.ID]; exists {
+			ag.Name = e.Name
+			ag.Kind = e.Kind
+			ag.Model = e.Model
+			ag.LogPath = e.LogPath
+			ag.Running = true
+		} else {
+			m.agents[e.ID] = &agentView{
+				ID:      e.ID,
+				Name:    e.Name,
+				Kind:    e.Kind,
+				Model:   e.Model,
+				LogPath: e.LogPath,
+				Running: true,
+			}
+			m.itemOrder = append(m.itemOrder, e.ID)
 		}
-		m.itemOrder = append(m.itemOrder, e.ID)
 		m.status = append(m.status, fmt.Sprintf("Started %s (%s)", e.Name, e.Kind))
 		m.ensureLog(e.ID)
 		m.updateViewport()
@@ -239,10 +349,27 @@ func (m *Model) handleEvent(ev events.Event) Model {
 			ag.Spinner = (ag.Spinner + 1) % len(spinnerFrames)
 		}
 		buf := m.ensureLog(e.ID)
-		buf.append(logEntry{Kind: e.Kind, Text: e.Line})
-		m.updateViewport()
-		if m.selected < len(m.itemOrder) && m.itemOrder[m.selected] == e.ID && !m.mouseOverLog {
-			m.view.GotoBottom()
+		kind := e.Kind
+		if ag, ok := m.agents[e.ID]; ok && ag.Kind == "Codex" {
+			switch strings.TrimSpace(e.Line) {
+			case "[exec]":
+				buf.doMode = true
+			case "[thinking]":
+				buf.doMode = false
+			}
+			if buf.doMode {
+				kind = events.MessageDo
+			}
+		}
+		trimmed := buf.append(logEntry{Kind: kind, Text: e.Line})
+		if trimmed && m.selected < len(m.itemOrder) && m.itemOrder[m.selected] == e.ID {
+			m.clampViewport()
+		}
+		if m.selected < len(m.itemOrder) && m.itemOrder[m.selected] == e.ID && !m.mouseOverLog && m.isAtBottom() {
+			m.scrollBottom = true
+		}
+		if c := m.requestViewportUpdate(); c != nil {
+			return *m, c
 		}
 	case events.StatusMessage:
 		m.status = append(m.status, e.Message)
@@ -254,19 +381,22 @@ func (m *Model) handleEvent(ev events.Event) Model {
 	case events.TodoLoaded:
 		m.todo = e.Content
 		m.todoPath = e.Path
-		m.updateViewport()
+		m.todoCache = todoCache{}
+		if c := m.requestViewportUpdate(); c != nil {
+			return *m, c
+		}
 	}
 
 	m.trimStatus()
 	m.ready = true
-	return *m
+	return *m, nil
 }
 
 func (m *Model) ensureLog(id string) *logBuffer {
 	if buf, ok := m.logs[id]; ok {
 		return buf
 	}
-	buf := &logBuffer{limit: 2000}
+	buf := &logBuffer{limit: logBufferLimit}
 	m.logs[id] = buf
 	return buf
 }
@@ -315,13 +445,12 @@ func (m *Model) updateViewport() {
 		content := m.renderSessionInfo()
 		m.view.SetContent(style.Render(content))
 	case "todo":
-		m.view.SetContent(style.Render(m.renderMarkdown(m.loadTodoContent())))
+		m.view.SetContent(style.Render(m.renderTodo()))
 	case "coded":
 		m.view.SetContent(style.Render(m.renderMetrics()))
 	default:
 		if buf, ok := m.logs[id]; ok {
-			m.view.SetContent(style.Render(m.renderAgentLog(buf)))
-			m.view.GotoBottom()
+			m.view.SetContent(style.Render(m.renderAgentLog(id, buf)))
 		} else {
 			m.view.SetContent(style.Render("waiting for output..."))
 		}
@@ -470,11 +599,15 @@ func (m *Model) trimStatus() {
 	}
 }
 
-func (b *logBuffer) append(entry logEntry) {
+func (b *logBuffer) append(entry logEntry) bool {
+	trimmed := false
 	b.lines = append(b.lines, entry)
 	if len(b.lines) > b.limit && b.limit > 0 {
 		b.lines = b.lines[len(b.lines)-b.limit:]
+		trimmed = true
 	}
+	b.dirty = true
+	return trimmed
 }
 
 func (b *logBuffer) content() string {
@@ -485,21 +618,50 @@ func (b *logBuffer) content() string {
 	return strings.Join(out, "\n")
 }
 
-func (m *Model) loadTodoContent() string {
-	// Prefer live read from disk so updates show without a restart.
+func (m *Model) todoFilePath() string {
 	path := m.todoPath
 	if path == "" {
-		path = fmt.Sprintf("%s/%s", m.session.Path, m.opts.Todo)
+		path = filepath.Join(m.session.Path, m.opts.Todo)
 	}
 	if m.opts.Repo != "" {
-		path = fmt.Sprintf("%s/%s", strings.TrimRight(m.opts.Repo, "/"), m.opts.Todo)
+		path = filepath.Join(m.opts.Repo, m.opts.Todo)
+	}
+	return path
+}
+
+func (m *Model) renderTodo() string {
+	path := m.todoFilePath()
+	width := m.view.Width
+	if width <= 0 {
+		width = 80
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Sprintf("todo not found: %s (%v)", path, err)
+	}
+
+	if m.todoCache.path == path &&
+		m.todoCache.width == width &&
+		!info.ModTime().After(m.todoCache.modTime) &&
+		m.todoCache.rendered != "" {
+		return m.todoCache.rendered
 	}
 
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("todo not found: %s (%v)", path, err)
 	}
-	return string(content)
+
+	rendered := m.renderMarkdown(string(content))
+	m.todoCache = todoCache{
+		path:     path,
+		modTime:  info.ModTime(),
+		width:    width,
+		rendered: rendered,
+	}
+
+	return rendered
 }
 
 func (m *Model) loadCodedSupervisor() string {
@@ -611,60 +773,177 @@ type codedLogEvent struct {
 	Message   string    `json:"message"`
 }
 
-func (m *Model) renderAgentLog(buf *logBuffer) string {
+func (m *Model) renderAgentLog(id string, buf *logBuffer) string {
+	tailDo := len(buf.lines) > 0 && buf.lines[len(buf.lines)-1].Kind == events.MessageDo
+	if tailDo {
+		buf.dirty = true
+	}
+	if !buf.dirty && buf.rendered != "" {
+		return buf.rendered
+	}
+
+	renderDeadline := time.Now().Add(markdownRenderBudget)
+	markdownAllowed := id == "supervisor"
 	lines := make([]string, 0, len(buf.lines))
-	for _, l := range buf.lines {
-		switch l.Kind {
-		case events.MessageDo:
-			lines = append(lines, lipgloss.NewStyle().Foreground(m.styles.do).Render("→ "+l.Text))
-		case events.MessageSee:
-			lines = append(lines, lipgloss.NewStyle().Foreground(m.styles.see).Render(l.Text))
-		default:
-			lines = append(lines, m.renderMarkdown(l.Text))
+	for i := range buf.lines {
+		l := &buf.lines[i]
+		useMarkdown := markdownAllowed && time.Now().Before(renderDeadline)
+		if l.rendered == "" || l.renderMarkdown != useMarkdown {
+			l.rendered = m.renderLogEntry(*l, useMarkdown)
+			l.renderMarkdown = useMarkdown
 		}
+		lines = append(lines, l.rendered)
+	}
+	if tailDo {
+		lines = append(lines, lipgloss.NewStyle().Foreground(m.styles.do).Render(m.spinner.View()+" running..."))
 	}
 	if len(lines) == 0 {
-		return "waiting for output..."
+		buf.rendered = "waiting for output..."
+	} else {
+		buf.rendered = strings.Join(lines, "\n")
 	}
-	return strings.Join(lines, "\n")
+	buf.dirty = false
+	return buf.rendered
+}
+
+func (m *Model) renderLogEntry(l logEntry, markdown bool) string {
+	switch l.Kind {
+	case events.MessageDo:
+		return lipgloss.NewStyle().Foreground(m.styles.do).Render("→ " + l.Text)
+	case events.MessageSee:
+		return lipgloss.NewStyle().Foreground(m.styles.see).Render(l.Text)
+	default:
+		if markdown {
+			return m.renderMarkdown(l.Text)
+		}
+		return l.Text
+	}
 }
 
 func waitForEvent(ch <-chan events.Event) tea.Cmd {
 	return func() tea.Msg {
 		if ch == nil {
-			return nil
+			return eventsClosedMsg{}
 		}
 		ev, ok := <-ch
 		if !ok {
-			return nil
+			return eventsClosedMsg{}
 		}
 		return ev
 	}
 }
 
+type eventsClosedMsg struct{}
+
 func (m *Model) renderMarkdown(text string) string {
-	width := m.view.Width
-	if width <= 0 {
-		width = 80
+	// Guard against pathological cases: very large content or slow renderer.
+	if len(text) > 8000 {
+		return text
 	}
-	if m.mdRenderer == nil || m.mdWidth != width {
+
+	if m.mdRenderer == nil {
 		r, err := glamour.NewTermRenderer(
 			glamour.WithAutoStyle(),
-			glamour.WithWordWrap(width),
+			glamour.WithWordWrap(0), // no reflow; render once per entry
 		)
 		if err == nil {
 			m.mdRenderer = r
-			m.mdWidth = width
 		}
 	}
 	if m.mdRenderer == nil {
 		return text
 	}
-	out, err := m.mdRenderer.Render(text)
-	if err != nil {
+	done := make(chan string, 1)
+	go func() {
+		m.mdMu.Lock()
+		defer m.mdMu.Unlock()
+		out, err := m.mdRenderer.Render(text)
+		if err != nil {
+			done <- text
+			return
+		}
+		done <- strings.TrimRight(out, "\n")
+	}()
+
+	select {
+	case out := <-done:
+		return out
+	case <-time.After(markdownRenderTimeout):
+		// Fall back to plain text if rendering is slow to avoid UI stalls.
 		return text
 	}
-	return strings.TrimRight(out, "\n")
+}
+
+func (m *Model) requestViewportUpdate() tea.Cmd {
+	if m.pendingView {
+		return nil
+	}
+	m.pendingView = true
+	const delay = 300 * time.Millisecond
+	return tea.Tick(delay, func(time.Time) tea.Msg { return viewportUpdateMsg{} })
+}
+
+type viewportUpdateMsg struct{}
+
+func (m *Model) isAtBottom() bool {
+	if m.view.Height == 0 {
+		return true
+	}
+	return m.view.AtBottom()
+}
+
+func (m *Model) anyPendingDo() bool {
+	for _, buf := range m.logs {
+		if len(buf.lines) > 0 && buf.lines[len(buf.lines)-1].Kind == events.MessageDo {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) markDoBuffersDirty() {
+	for _, buf := range m.logs {
+		if len(buf.lines) > 0 && buf.lines[len(buf.lines)-1].Kind == events.MessageDo {
+			buf.dirty = true
+		}
+	}
+}
+
+func (m *Model) clampViewport() {
+	if m.view.PastBottom() {
+		m.view.GotoBottom()
+	}
+}
+
+func (m *Model) startInjectPrompt() {
+	if m.inputActive {
+		return
+	}
+	if m.selected >= len(m.itemOrder) {
+		return
+	}
+	id := m.itemOrder[m.selected]
+	if id == "session" || id == "todo" || id == "coded" {
+		return
+	}
+	m.inputField.SetWidth(m.view.Width)
+	m.inputActive = true
+	m.inputTarget = id
+	m.inputField.Reset()
+	m.inputField.Focus()
+}
+
+func (m Model) renderInputOverlay() string {
+	label := fmt.Sprintf("Inject & restart %s", title(m.inputTarget))
+	warn := "Note: agent restarts fresh; context comes from its log."
+	body := fmt.Sprintf("%s\n%s\n\n%s", label, warn, m.inputField.View())
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.styles.border).
+		Padding(1, 2).
+		Width(m.view.Width + 2).
+		Height(m.view.Height + 2)
+	return box.Render(body)
 }
 
 func title(s string) string {

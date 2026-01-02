@@ -27,6 +27,8 @@ type Agent struct {
 	Display  string
 	CLI      CLI
 	events   chan<- events.Event
+	done     chan struct{}
+	lastExit int
 	restarts int
 
 	cmd             *exec.Cmd
@@ -48,14 +50,20 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("agent %s already running", a.ID)
 	}
 
+	a.done = make(chan struct{})
+
 	if err := os.MkdirAll(filepath.Dir(a.LogPath), 0o755); err != nil {
 		return err
 	}
-	logFile, err := os.Create(a.LogPath)
+	logFile, err := os.OpenFile(a.LogPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("create log: %w", err)
 	}
 	a.logFile = logFile
+
+	if info, err := logFile.Stat(); err == nil && info.Size() > 0 {
+		_, _ = fmt.Fprintln(a.logFile)
+	}
 
 	_, _ = fmt.Fprintf(a.logFile, "[%s] %s starting\n", time.Now().Format(time.RFC3339), a.Name)
 	_, _ = fmt.Fprintf(a.logFile, "[%s] workdir: %s\n", time.Now().Format(time.RFC3339), a.Workdir)
@@ -65,12 +73,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	cmd.Dir = a.Workdir
 
 	_, _ = fmt.Fprintf(a.logFile, "[%s] command: %s %s\n\n", time.Now().Format(time.RFC3339), a.CLI.Command(), strings.Join(args, " "))
-
-	// Tail the log file so UI sees live output (mirrors the C# message stream).
-	tailCtx, cancel := context.WithCancel(context.Background())
-	a.tailCancel = cancel
-	a.tailWG.Add(1)
-	go a.tailFile(tailCtx)
 
 	if a.CLI.UseStdin() {
 		stdin, err := cmd.StdinPipe()
@@ -101,14 +103,24 @@ func (a *Agent) Start(ctx context.Context) error {
 	if display == "" {
 		display = a.Model
 	}
-	a.emit(events.AgentAdded{
+	added := events.AgentAdded{
 		ID:       a.ID,
 		Name:     a.Name,
 		Kind:     a.CLI.Name(),
 		Model:    display,
 		LogPath:  a.LogPath,
 		Worktree: a.Workdir,
-	})
+	}
+	a.emit(added)
+	// Log the add to help debug missing agents in the UI.
+	a.emit(events.StatusMessage{Message: fmt.Sprintf("agent added: %s (%s) log=%s", added.ID, added.Kind, added.LogPath)})
+
+	// Tail the log after we've announced the agent to the UI to avoid dropping
+	// the AgentAdded event if the channel is momentarily full from old log data.
+	tailCtx, cancel := context.WithCancel(context.Background())
+	a.tailCancel = cancel
+	a.tailWG.Add(1)
+	go a.tailFile(tailCtx)
 
 	go a.stream(stdout)
 	go a.stream(stderr)
@@ -151,6 +163,10 @@ func (a *Agent) wait(ctx context.Context) {
 			exit = 1
 		}
 	}
+	a.mu.Lock()
+	a.lastExit = exit
+	done := a.done
+	a.mu.Unlock()
 
 	select {
 	case <-ctx.Done():
@@ -177,16 +193,27 @@ func (a *Agent) wait(ctx context.Context) {
 		a.tailCancel()
 	}
 	a.tailWG.Wait()
+
+	if done != nil {
+		close(done)
+	}
 }
 
 func (a *Agent) emit(ev events.Event) {
 	if a.events == nil {
 		return
 	}
-	select {
-	case a.events <- ev:
+	defer func() { _ = recover() }()
+	switch ev.(type) {
+	case events.AgentAdded:
+		// Agent presence is critical; block rather than drop.
+		a.events <- ev
 	default:
-		// Drop if channel is full to keep agents flowing.
+		select {
+		case a.events <- ev:
+		default:
+			// Drop if channel is full to keep agents flowing.
+		}
 	}
 }
 
@@ -269,7 +296,7 @@ func (a *Agent) tailFile(ctx context.Context) {
 	}
 }
 
-var ansiRegexp = regexp.MustCompile("\x1B\\[[0-9;]*[A-Za-z]")
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 func cleanLine(input string) string {
 	stripped := ansiRegexp.ReplaceAllString(input, "")
@@ -325,4 +352,18 @@ func (a *Agent) supervisorSummary(text string) string {
 	}
 
 	return ""
+}
+
+// Done returns a channel that closes when the agent process exits.
+func (a *Agent) Done() <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.done
+}
+
+// ExitCode returns the last recorded exit code after the agent stops.
+func (a *Agent) ExitCode() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastExit
 }

@@ -5,10 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/asynkron/Asynkron.SwarmGo/internal/config"
+	"github.com/asynkron/Asynkron.SwarmGo/internal/control"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/detector"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/events"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/orchestrator"
@@ -18,19 +22,46 @@ import (
 )
 
 func main() {
-	opts, supervisorFlag := parseFlags()
+	opts, supervisorFlag, prepAgentFlag, minutesOverride, minutesSet := parseFlags()
 
 	if opts.Detect {
 		runDetect()
 		return
 	}
 
-	supervisorType, err := parseAgentType(supervisorFlag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid --supervisor value: %v\n", err)
-		os.Exit(1)
+	var (
+		sess   *session.Session
+		resume bool
+		err    error
+	)
+
+	if opts.Resume != "" {
+		sess, err = session.Load(opts.Resume)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load session: %v\n", err)
+			os.Exit(1)
+		}
+		opts = sess.Options
+		// Allow overriding minutes on resume to extend/shorten the run.
+		if minutesSet {
+			opts.Minutes = minutesOverride
+		}
+		resume = true
+	} else {
+		supervisorType, err := parseAgentType(supervisorFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --supervisor value: %v\n", err)
+			os.Exit(1)
+		}
+		opts.Supervisor = supervisorType
+
+		prepAgent, err := parseAgentType(prepAgentFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --prep-agent value: %v\n", err)
+			os.Exit(1)
+		}
+		opts.PrepAgent = prepAgent
 	}
-	opts.Supervisor = supervisorType
 
 	if err := opts.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -44,34 +75,37 @@ func main() {
 		}
 	}
 
-	if opts.Resume != "" {
-		fmt.Fprintf(os.Stderr, "resume is not implemented in the Go port yet\n")
-		os.Exit(1)
+	if sess == nil {
+		sess, err = session.New(opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create session: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	sess, err := session.New(opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create session: %v\n", err)
-		os.Exit(1)
-	}
-
-	eventCh := make(chan events.Event, 256)
-	ctx, cancel := context.WithCancel(context.Background())
+	eventCh := make(chan events.Event, 512)
+	ctrlCh := make(chan control.Command, 16)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		orch := orchestrator.New(sess, opts, eventCh)
+		orch := orchestrator.New(sess, opts, resume, eventCh, ctrlCh)
 		if err := orch.Run(ctx); err != nil && ctx.Err() == nil {
 			eventCh <- events.StatusMessage{Message: fmt.Sprintf("orchestrator error: %v", err)}
 		}
 		close(eventCh)
 	}()
 
-	program := tea.NewProgram(ui.New(sess, opts, eventCh), tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := program.Run(); err != nil {
+	program := tea.NewProgram(
+		ui.New(sess, opts, eventCh, ctrlCh),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		tea.WithContext(ctx),
+	)
+	if _, err := program.Run(); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "ui error: %v\n", err)
 	}
 
@@ -79,9 +113,11 @@ func main() {
 	wg.Wait()
 }
 
-func parseFlags() (config.Options, string) {
+func parseFlags() (config.Options, string, string, int, bool) {
 	var opts config.Options
 	var supervisor string
+	var prepAgent string
+	minutesFlag := &intFlag{value: 15}
 
 	flag.IntVar(&opts.ClaudeWorkers, "claude", 0, "number of Claude worker agents")
 	flag.IntVar(&opts.CodexWorkers, "codex", 0, "number of Codex worker agents")
@@ -89,17 +125,40 @@ func parseFlags() (config.Options, string) {
 	flag.IntVar(&opts.GeminiWorkers, "gemini", 0, "number of Gemini worker agents")
 	flag.StringVar(&opts.Repo, "repo", "", "path to git repository (defaults to current repo)")
 	flag.StringVar(&opts.Todo, "todo", "todo.md", "path to todo file relative to repo")
-	flag.IntVar(&opts.Minutes, "minutes", 15, "minutes to run before stopping workers")
+	flag.Var(minutesFlag, "minutes", "minutes to run before stopping workers")
 	flag.BoolVar(&opts.Arena, "arena", false, "arena mode (multiple timed rounds)")
 	flag.BoolVar(&opts.Autopilot, "autopilot", true, "autopilot mode (workers create PR branches)")
 	flag.IntVar(&opts.MaxRounds, "max-rounds", 10, "maximum number of rounds in arena mode")
-	flag.StringVar(&opts.Resume, "resume", "", "resume a previous session (not yet implemented)")
+	flag.StringVar(&opts.Resume, "resume", "", "resume a previous session by its ID")
 	flag.BoolVar(&opts.Detect, "detect", false, "detect installed CLI agents and exit")
 	flag.BoolVar(&opts.SkipDetect, "skip-detect", false, "skip agent detection")
 	flag.StringVar(&supervisor, "supervisor", "claude", "supervisor agent type (claude|codex|copilot|gemini)")
+	flag.StringVar(&prepAgent, "prep-agent", "claude", "agent type for prep (claude|codex|copilot|gemini)")
 
 	flag.Parse()
-	return opts, supervisor
+
+	opts.Minutes = minutesFlag.value
+	return opts, supervisor, prepAgent, minutesFlag.value, minutesFlag.set
+}
+
+// intFlag tracks whether the flag was explicitly set.
+type intFlag struct {
+	value int
+	set   bool
+}
+
+func (f *intFlag) String() string {
+	return fmt.Sprintf("%d", f.value)
+}
+
+func (f *intFlag) Set(s string) error {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return err
+	}
+	f.value = v
+	f.set = true
+	return nil
 }
 
 func parseAgentType(value string) (config.AgentType, error) {
@@ -153,6 +212,7 @@ func ensureAgentsInstalled(opts config.Options) error {
 		required[config.AgentGemini] = true
 	}
 	required[opts.Supervisor] = true
+	required[opts.PrepAgent] = true
 
 	missing := []string{}
 	for _, st := range statuses {
