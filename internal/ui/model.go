@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -41,6 +42,7 @@ type Model struct {
 	listWidth    int
 	mouseOverLog bool
 	mouseEnabled bool
+	hasCoded     bool
 }
 
 type agentView struct {
@@ -298,6 +300,8 @@ func (m *Model) updateViewport() {
 		m.view.SetContent(style.Render(content))
 	case "todo":
 		m.view.SetContent(style.Render(m.renderMarkdown(m.loadTodoContent())))
+	case "coded":
+		m.view.SetContent(style.Render(m.renderMarkdown(m.loadCodedSupervisor())))
 	default:
 		if buf, ok := m.logs[id]; ok {
 			m.view.SetContent(style.Render(m.renderAgentLog(buf)))
@@ -347,6 +351,8 @@ func (m Model) renderList() string {
 			rows = append(rows, m.renderRow("Session", m.session.ID, selected, ""))
 		case "todo":
 			rows = append(rows, m.renderRow("Todo", m.opts.Todo, selected, ""))
+		case "coded":
+			rows = append(rows, m.renderRow("Coded Supervisor", filepath.Base(m.session.CodedSupervisorPath()), selected, ""))
 		default:
 			ag := m.agents[id]
 			var state string
@@ -476,6 +482,15 @@ func (m *Model) loadTodoContent() string {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("todo not found: %s (%v)", path, err)
+	}
+	return string(content)
+}
+
+func (m *Model) loadCodedSupervisor() string {
+	path := m.session.CodedSupervisorPath()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("coded supervisor not found: %s (%v)", path, err)
 	}
 	return string(content)
 }
