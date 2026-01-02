@@ -10,3 +10,13 @@ type RestartAgent struct {
 }
 
 func (RestartAgent) isCommand() {}
+
+// StopAgent requests that an agent be stopped.
+type StopAgent struct{ AgentID string }
+
+func (StopAgent) isCommand() {}
+
+// StartAgent requests that an agent be started (or restarted) without an injected message.
+type StartAgent struct{ AgentID string }
+
+func (StartAgent) isCommand() {}

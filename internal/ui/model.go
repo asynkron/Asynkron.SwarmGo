@@ -237,6 +237,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.view.LineUp(10)
 		case "pgdown":
 			m.view.LineDown(10)
+		case " ":
+			m.toggleAgent()
 		case "enter":
 			m.startInjectPrompt()
 		case "m":
@@ -972,6 +974,32 @@ func (m *Model) startInjectPrompt() {
 	m.inputTarget = id
 	m.inputField.Reset()
 	m.inputField.Focus()
+}
+
+func (m *Model) toggleAgent() {
+	if m.selected >= len(m.itemOrder) {
+		return
+	}
+	id := m.itemOrder[m.selected]
+	if id == "session" || id == "todo" || id == "coded" || id == "app" {
+		return
+	}
+	ag, ok := m.agents[id]
+	if !ok {
+		return
+	}
+	if ag.Running {
+		if m.control != nil {
+			go func() { m.control <- control.StopAgent{AgentID: id} }()
+		}
+		m.status = append(m.status, fmt.Sprintf("Stop requested for %s", id))
+	} else {
+		if m.control != nil {
+			go func() { m.control <- control.StartAgent{AgentID: id} }()
+		}
+		m.status = append(m.status, fmt.Sprintf("Start requested for %s", id))
+	}
+	m.trimStatus()
 }
 
 func (m Model) renderInputOverlay() string {

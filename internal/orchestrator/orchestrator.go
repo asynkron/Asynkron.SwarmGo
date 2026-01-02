@@ -362,6 +362,10 @@ func (o *Orchestrator) handleControl(ctx context.Context, cmd control.Command) e
 	switch c := cmd.(type) {
 	case control.RestartAgent:
 		return o.restartAgent(ctx, c.AgentID, c.Message)
+	case control.StopAgent:
+		return o.stopAgent(c.AgentID)
+	case control.StartAgent:
+		return o.restartAgent(ctx, c.AgentID, "")
 	default:
 		return fmt.Errorf("unknown control command %T", cmd)
 	}
@@ -399,6 +403,25 @@ func (o *Orchestrator) restartAgent(ctx context.Context, id string, message stri
 		return o.restartSupervisor(ctx, id, message)
 	}
 	return fmt.Errorf("no restart spec for %s", id)
+}
+
+func (o *Orchestrator) stopAgent(id string) error {
+	o.logf("control: stopping %s", id)
+	o.mu.Lock()
+	var target *agents.Agent
+	for _, a := range o.agents {
+		if a.ID == id {
+			target = a
+			break
+		}
+	}
+	o.mu.Unlock()
+	if target == nil {
+		return fmt.Errorf("agent %s not found", id)
+	}
+	target.Stop()
+	o.emit(events.StatusMessage{Message: fmt.Sprintf("Stopped %s", id)})
+	return nil
 }
 
 func (o *Orchestrator) buildWorktreePaths() []string {
