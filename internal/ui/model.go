@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -316,7 +317,7 @@ func (m *Model) updateViewport() {
 	case "todo":
 		m.view.SetContent(style.Render(m.renderMarkdown(m.loadTodoContent())))
 	case "coded":
-		m.view.SetContent(style.Render(m.renderMarkdown(m.loadCodedSupervisor())))
+		m.view.SetContent(style.Render(m.renderMetrics()))
 	default:
 		if buf, ok := m.logs[id]; ok {
 			m.view.SetContent(style.Render(m.renderAgentLog(buf)))
@@ -508,6 +509,106 @@ func (m *Model) loadCodedSupervisor() string {
 		return fmt.Sprintf("coded supervisor not found: %s (%v)", path, err)
 	}
 	return string(content)
+}
+
+func (m *Model) renderMetrics() string {
+	path := m.session.CodedSupervisorPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("metrics not found: %s (%v)", path, err)
+	}
+	var snap codedSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return fmt.Sprintf("failed to parse metrics (%v)", err)
+	}
+	if len(snap.Workers) == 0 {
+		return "no metrics yet"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Updated: %s\n\n", snap.UpdatedAt.Format("15:04:05"))
+	for _, w := range snap.Workers {
+		fmt.Fprintf(&b, "Worker %d\n", w.WorkerNumber)
+		if w.Git.Error != "" {
+			fmt.Fprintf(&b, "  Git error: %s\n\n", w.Git.Error)
+			continue
+		}
+		fmt.Fprintf(&b, "  Branch: %s\n", w.Git.Branch)
+		writeChanges := func(title string, list []fileChange) {
+			if len(list) == 0 {
+				return
+			}
+			fmt.Fprintf(&b, "  %s:\n", title)
+			for _, fc := range list {
+				fmt.Fprintf(&b, "    * %s  +%d -%d\n", fc.File, fc.Added, fc.Deleted)
+			}
+		}
+		writeChanges("Staged", w.Git.Staged)
+		writeChanges("Unstaged", w.Git.Unstaged)
+		if len(w.Git.Untracked) > 0 {
+			fmt.Fprintf(&b, "  Untracked:\n")
+			for _, f := range w.Git.Untracked {
+				fmt.Fprintf(&b, "    * %s\n", f)
+			}
+		}
+		if len(w.Git.RecentCommits) > 0 {
+			fmt.Fprintf(&b, "  Recent commits:\n")
+			for _, c := range w.Git.RecentCommits {
+				fmt.Fprintf(&b, "    * %s\n", c)
+			}
+		}
+		if w.Logs.LastPass != nil || w.Logs.LastFail != nil {
+			fmt.Fprintf(&b, "  Tests:\n")
+			if w.Logs.LastPass != nil {
+				fmt.Fprintf(&b, "    last pass: %s\n", w.Logs.LastPass.Message)
+			}
+			if w.Logs.LastFail != nil {
+				fmt.Fprintf(&b, "    last fail: %s\n", w.Logs.LastFail.Message)
+			}
+		}
+		fmt.Fprintln(&b)
+	}
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+type codedSnapshot struct {
+	UpdatedAt time.Time     `json:"updatedAt"`
+	Workers   []codedWorker `json:"workers"`
+}
+
+type codedWorker struct {
+	WorkerNumber int           `json:"workerNumber"`
+	Git          codedGit      `json:"git"`
+	Logs         codedLogState `json:"logs"`
+	LastUpdated  time.Time     `json:"lastUpdated"`
+}
+
+type codedGit struct {
+	Branch        string       `json:"branch"`
+	Staged        []fileChange `json:"staged"`
+	Unstaged      []fileChange `json:"unstaged"`
+	Untracked     []string     `json:"untracked"`
+	RecentCommits []string     `json:"recentCommits"`
+	Error         string       `json:"error"`
+}
+
+type fileChange struct {
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
+	File    string `json:"file"`
+}
+
+type codedLogState struct {
+	LastPass *codedLogEvent  `json:"lastPass"`
+	LastFail *codedLogEvent  `json:"lastFail"`
+	Recent   []codedLogEvent `json:"recent"`
+}
+
+type codedLogEvent struct {
+	Timestamp time.Time `json:"timestamp"`
+	Kind      string    `json:"kind"`
+	Message   string    `json:"message"`
 }
 
 func (m *Model) renderAgentLog(buf *logBuffer) string {
