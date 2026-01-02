@@ -3,6 +3,7 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -560,12 +561,14 @@ func (m Model) renderLog() string {
 	selectedID := m.itemOrder[m.selected]
 	header := title(selectedID)
 	content := lipgloss.NewStyle().Width(m.view.Width).Height(m.view.Height).Render(m.view.View())
+	scroll := m.renderScrollbar(m.view.Height, m.view.ScrollPercent())
+	content = lipgloss.JoinHorizontal(lipgloss.Top, content, scroll)
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.styles.border).
 		Padding(0, 1).
-		Width(m.view.Width + 2).
+		Width(m.view.Width + 3).
 		Height(m.view.Height + 2)
 	return box.Render(header + "\n" + content)
 }
@@ -919,6 +922,29 @@ func (m *Model) clampViewport() {
 	if m.view.PastBottom() {
 		m.view.GotoBottom()
 	}
+}
+
+func (m Model) renderScrollbar(height int, percent float64) string {
+	if height <= 0 {
+		return ""
+	}
+	// Simple progress-style scrollbar from top.
+	filled := int(math.Round(percent * float64(height)))
+	if filled < 1 && percent > 0 {
+		filled = 1
+	}
+	if filled > height {
+		filled = height
+	}
+	lines := make([]string, height)
+	for i := 0; i < height; i++ {
+		if i < filled {
+			lines[i] = "█"
+		} else {
+			lines[i] = "░"
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) startInjectPrompt() {
