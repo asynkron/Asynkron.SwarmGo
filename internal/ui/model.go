@@ -49,11 +49,16 @@ type agentView struct {
 }
 
 type logBuffer struct {
-	lines []string
+	lines []logEntry
 	limit int
 }
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+type logEntry struct {
+	Kind events.AgentMessageKind
+	Text string
+}
 
 // New returns a ready-to-run UI model.
 func New(sess *session.Session, opts config.Options, events <-chan events.Event) Model {
@@ -168,7 +173,7 @@ func (m *Model) handleEvent(ev events.Event) Model {
 			ag.Spinner = (ag.Spinner + 1) % len(spinnerFrames)
 		}
 		buf := m.ensureLog(e.ID)
-		buf.append(e.Line)
+		buf.append(logEntry{Kind: e.Kind, Text: e.Line})
 		m.updateViewport()
 	case events.StatusMessage:
 		m.status = append(m.status, e.Message)
@@ -401,18 +406,28 @@ func (m *Model) trimStatus() {
 	}
 }
 
-func (b *logBuffer) append(line string) {
-	if b.lines == nil {
-		b.lines = []string{}
-	}
-	b.lines = append(b.lines, line)
+func (b *logBuffer) append(entry logEntry) {
+	b.lines = append(b.lines, entry)
 	if len(b.lines) > b.limit && b.limit > 0 {
 		b.lines = b.lines[len(b.lines)-b.limit:]
 	}
 }
 
 func (b *logBuffer) content() string {
-	return strings.Join(b.lines, "\n")
+	out := make([]string, 0, len(b.lines))
+	for _, l := range b.lines {
+		prefix := ""
+		switch l.Kind {
+		case events.MessageDo:
+			prefix = "→ "
+		case events.MessageSee:
+			prefix = ""
+		default:
+			prefix = ""
+		}
+		out = append(out, prefix+l.Text)
+	}
+	return strings.Join(out, "\n")
 }
 
 func (m *Model) loadTodoContent() string {

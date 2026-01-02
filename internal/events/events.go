@@ -23,6 +23,7 @@ type AgentStopped struct {
 
 type AgentLine struct {
 	ID   string
+	Kind AgentMessageKind
 	Line string
 }
 
@@ -46,6 +47,15 @@ type CompletedWorker struct {
 	Worker  int
 	LogPath string
 }
+
+// AgentMessageKind mirrors Say/Do/See categories from the original UI.
+type AgentMessageKind int
+
+const (
+	MessageSay AgentMessageKind = iota
+	MessageDo
+	MessageSee
+)
 
 func (AgentAdded) isEvent()      {}
 func (AgentRemoved) isEvent()    {}

@@ -222,7 +222,9 @@ func (a *Agent) tailFile(ctx context.Context) {
 
 			line, err := reader.ReadString('\n')
 			if line != "" {
-				a.emit(events.AgentLine{ID: a.ID, Line: strings.TrimRight(line, "\r\n")})
+				for _, msg := range a.CLI.Parse(strings.TrimRight(line, "\r\n")) {
+					a.emit(events.AgentLine{ID: a.ID, Kind: msg.Kind, Line: msg.Text})
+				}
 			}
 			if err == nil {
 				continue
