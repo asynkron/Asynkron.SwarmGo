@@ -341,6 +341,22 @@ func (m Model) renderLog() string {
 		return box.Render(header + "\n" + body)
 	}
 
+	// If an agent is selected, render its buffer directly to avoid viewport state glitches.
+	if selectedID != "session" {
+		content := ""
+		if buf, ok := m.logs[selectedID]; ok {
+			content = buf.content()
+		}
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(m.styles.border).
+			Padding(0, 1).
+			Width(m.view.Width + 2).
+			Height(m.view.Height + 2)
+		body := lipgloss.NewStyle().Width(m.view.Width).Render(content)
+		return box.Render(header + "\n" + body)
+	}
+
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.styles.border).
