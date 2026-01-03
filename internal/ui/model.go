@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,8 @@ type Model struct {
 	mdRenderer   *glamour.TermRenderer
 	mdMu         sync.Mutex
 	todoCache    todoCache
+	codedCache   codedCache
+	listView     viewport.Model
 	inputActive  bool
 	inputField   textarea.Model
 	inputTarget  string
@@ -87,6 +90,11 @@ type todoCache struct {
 	rendered string
 }
 
+type codedCache struct {
+	modTime  time.Time
+	snapshot codedSnapshot
+}
+
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 const (
@@ -110,6 +118,8 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event,
 	theme := defaultTheme()
 	sp := spinner.New()
 	sp.Style = lipgloss.NewStyle().Foreground(theme.accent)
+	listView := viewport.New(34, 20)
+	listView.MouseWheelEnabled = true
 
 	ti := textarea.New()
 	ti.Prompt = ""
@@ -133,6 +143,7 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event,
 		spinner:      sp,
 		control:      control,
 		inputField:   ti,
+		listView:     listView,
 	}
 	// Default to showing the todo panel first so something useful is visible.
 	if len(m.itemOrder) > 1 {
@@ -444,6 +455,8 @@ func (m *Model) resize() {
 	}
 	m.view.Width = logWidth
 	m.view.Height = logHeight
+	m.listView.Width = listWidth - 2
+	m.listView.Height = logHeight
 	m.updateViewport()
 }
 
@@ -508,8 +521,12 @@ func (m Model) renderHeader() string {
 
 func (m Model) renderList() string {
 	var rows []string
+	selectedIndex := -1
 	for i, id := range m.itemOrder {
 		selected := i == m.selected
+		if selected {
+			selectedIndex = i
+		}
 		switch id {
 		case "session":
 			rows = append(rows, m.renderRow("Session", m.session.ID, selected, ""))
@@ -536,14 +553,31 @@ func (m Model) renderList() string {
 			}
 			meta := fmt.Sprintf("%s %s", ag.Kind, ag.Model)
 			rows = append(rows, m.renderRow(ag.Name, meta, selected, state))
+			if info := m.renderWorkerSummary(id); info != "" {
+				rows = append(rows, info)
+			}
+			if details := m.renderWorkerFiles(id); details != "" {
+				rows = append(rows, details)
+			}
 		}
 	}
 	list := strings.Join(rows, "\n")
+
+	m.listView.SetContent(list)
+	if selectedIndex >= 0 {
+		if selectedIndex < m.listView.YOffset {
+			m.listView.YOffset = selectedIndex
+		} else if selectedIndex >= m.listView.YOffset+m.listView.Height {
+			m.listView.YOffset = selectedIndex - m.listView.Height + 1
+		}
+	}
+	content := m.listView.View()
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.styles.border).
-		Width(34).
-		Render(list)
+		Width(m.listWidth).
+		Height(m.listView.Height + 2).
+		Render(content)
 }
 
 func (m Model) renderRow(name, meta string, selected bool, prefix string) string {
@@ -564,6 +598,75 @@ func (m Model) renderRow(name, meta string, selected bool, prefix string) string
 		row = prefix + " " + row
 	}
 	return row
+}
+
+func (m *Model) renderWorkerSummary(id string) string {
+	if !strings.HasPrefix(id, "worker-") {
+		return ""
+	}
+	var workerNum int
+	if _, err := fmt.Sscanf(id, "worker-%d", &workerNum); err != nil {
+		return ""
+	}
+	snap := m.loadCodedSnapshot()
+	if snap == nil {
+		return ""
+	}
+	var ws *codedWorker
+	for i := range snap.Workers {
+		if snap.Workers[i].WorkerNumber == workerNum {
+			ws = &snap.Workers[i]
+			break
+		}
+	}
+	if ws == nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 2)
+	if ws.Git.Branch != "" {
+		parts = append(parts, fmt.Sprintf("Branch: %s", ws.Git.Branch))
+	}
+	if counts := summarizeCounts(ws.Git); counts != "" {
+		parts = append(parts, counts)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return lipgloss.NewStyle().Foreground(m.styles.dim).Render("  " + strings.Join(parts, "  "))
+}
+
+func (m *Model) renderWorkerFiles(id string) string {
+	if !strings.HasPrefix(id, "worker-") {
+		return ""
+	}
+	var workerNum int
+	if _, err := fmt.Sscanf(id, "worker-%d", &workerNum); err != nil {
+		return ""
+	}
+	snap := m.loadCodedSnapshot()
+	if snap == nil {
+		return ""
+	}
+	var ws *codedWorker
+	for i := range snap.Workers {
+		if snap.Workers[i].WorkerNumber == workerNum {
+			ws = &snap.Workers[i]
+			break
+		}
+	}
+	if ws == nil {
+		return ""
+	}
+
+	lines := summarizeFileLines(ws.Git.Staged, ws.Git.Unstaged, ws.Git.Untracked, 4)
+	if len(lines) == 0 {
+		return ""
+	}
+	for i := range lines {
+		lines[i] = "    " + lines[i]
+	}
+	return lipgloss.NewStyle().Foreground(m.styles.dim).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) renderLog() string {
@@ -703,6 +806,27 @@ func (m *Model) loadCodedSupervisor() string {
 	return string(content)
 }
 
+func (m *Model) loadCodedSnapshot() *codedSnapshot {
+	path := m.session.CodedSupervisorPath()
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if m.codedCache.snapshot.Workers != nil && !info.ModTime().After(m.codedCache.modTime) {
+		return &m.codedCache.snapshot
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var snap codedSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return nil
+	}
+	m.codedCache = codedCache{modTime: info.ModTime(), snapshot: snap}
+	return &m.codedCache.snapshot
+}
+
 func (m *Model) renderMetrics() string {
 	path := m.session.CodedSupervisorPath()
 	raw, err := os.ReadFile(path)
@@ -801,6 +925,66 @@ type codedLogEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	Kind      string    `json:"kind"`
 	Message   string    `json:"message"`
+}
+
+func summarizeCounts(g codedGit) string {
+	staged := len(g.Staged)
+	unstaged := len(g.Unstaged)
+	untracked := len(g.Untracked)
+	parts := make([]string, 0, 3)
+	if staged > 0 {
+		parts = append(parts, fmt.Sprintf("%d staged", staged))
+	}
+	if unstaged > 0 {
+		parts = append(parts, fmt.Sprintf("%d unstaged", unstaged))
+	}
+	if untracked > 0 {
+		parts = append(parts, fmt.Sprintf("%d untracked", untracked))
+	}
+	return strings.Join(parts, " / ")
+}
+
+func summarizeFileLines(staged, unstaged []fileChange, untracked []string, limit int) []string {
+	type entry struct {
+		file    string
+		added   int
+		removed int
+		source  string
+	}
+	var entries []entry
+	for _, fc := range staged {
+		entries = append(entries, entry{file: fc.File, added: fc.Added, removed: fc.Deleted, source: "staged"})
+	}
+	for _, fc := range unstaged {
+		entries = append(entries, entry{file: fc.File, added: fc.Added, removed: fc.Deleted, source: "unstaged"})
+	}
+	for _, f := range untracked {
+		entries = append(entries, entry{file: f, added: 0, removed: 0, source: "untracked"})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		ai := entries[i].added + entries[i].removed
+		aj := entries[j].added + entries[j].removed
+		if ai == aj {
+			return entries[i].file < entries[j].file
+		}
+		return ai > aj
+	})
+
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		switch e.source {
+		case "untracked":
+			lines = append(lines, fmt.Sprintf("• %s (untracked)", e.file))
+		case "staged":
+			lines = append(lines, fmt.Sprintf("• %s  +%d -%d (staged)", e.file, e.added, e.removed))
+		default:
+			lines = append(lines, fmt.Sprintf("• %s  +%d -%d", e.file, e.added, e.removed))
+		}
+	}
+	return lines
 }
 
 func (m *Model) renderAgentLog(id string, buf *logBuffer) string {
