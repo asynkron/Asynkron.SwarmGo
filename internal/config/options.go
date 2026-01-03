@@ -23,6 +23,8 @@ type Options struct {
 	Autopilot  bool
 	Supervisor AgentType
 	PrepAgent  AgentType
+	AgentMode  bool
+	AgentType  AgentType
 
 	Resume     string
 	Detect     bool
@@ -58,7 +60,14 @@ func (o *Options) Validate() error {
 		return errors.New("max rounds must be at least 1")
 	}
 
-	if o.ClaudeWorkers+o.CodexWorkers+o.CopilotWorkers+o.GeminiWorkers == 0 {
+	if o.AgentMode {
+		o.ClaudeWorkers, o.CodexWorkers, o.CopilotWorkers, o.GeminiWorkers = 0, 0, 0, 0
+		if o.AgentType == "" {
+			o.AgentType = AgentCodex
+		}
+		// Single-agent mode runs directly in the repo; disable autopilot/branch creation.
+		o.Autopilot = false
+	} else if o.ClaudeWorkers+o.CodexWorkers+o.CopilotWorkers+o.GeminiWorkers == 0 {
 		// Default to two Claude workers when nothing is specified.
 		o.ClaudeWorkers = 2
 	}
@@ -104,6 +113,9 @@ func (o *Options) Validate() error {
 
 // TotalWorkers returns the sum of all configured worker counts.
 func (o Options) TotalWorkers() int {
+	if o.AgentMode {
+		return 1
+	}
 	return o.ClaudeWorkers + o.CodexWorkers + o.CopilotWorkers + o.GeminiWorkers
 }
 

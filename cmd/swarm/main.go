@@ -119,6 +119,7 @@ func parseFlags() (config.Options, string, string, int, bool) {
 	var opts config.Options
 	var supervisor string
 	var prepAgent string
+	var agentType string
 	minutesFlag := &intFlag{value: 15}
 
 	flag.IntVar(&opts.ClaudeWorkers, "claude", 0, "number of Claude worker agents")
@@ -136,10 +137,20 @@ func parseFlags() (config.Options, string, string, int, bool) {
 	flag.BoolVar(&opts.SkipDetect, "skip-detect", false, "skip agent detection")
 	flag.StringVar(&supervisor, "supervisor", "claude", "supervisor agent type (claude|codex|copilot|gemini)")
 	flag.StringVar(&prepAgent, "prep-agent", "claude", "agent type for prep (claude|codex|copilot|gemini)")
+	flag.BoolVar(&opts.AgentMode, "agent", false, "run a single agent directly in the repo (no prep/supervisor)")
+	flag.StringVar(&agentType, "agent-type", "codex", "agent type for --agent mode (claude|codex|copilot|gemini)")
 
 	flag.Parse()
 
 	opts.Minutes = minutesFlag.value
+	if opts.AgentMode {
+		at, err := parseAgentType(agentType)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --agent-type value: %v\n", err)
+			os.Exit(1)
+		}
+		opts.AgentType = at
+	}
 	return opts, supervisor, prepAgent, minutesFlag.value, minutesFlag.set
 }
 
@@ -201,20 +212,24 @@ func runDetect() {
 func ensureAgentsInstalled(opts config.Options) error {
 	statuses := detector.DetectAll()
 	required := map[config.AgentType]bool{}
-	if opts.ClaudeWorkers > 0 {
-		required[config.AgentClaude] = true
+	if opts.AgentMode {
+		required[opts.AgentType] = true
+	} else {
+		if opts.ClaudeWorkers > 0 {
+			required[config.AgentClaude] = true
+		}
+		if opts.CodexWorkers > 0 {
+			required[config.AgentCodex] = true
+		}
+		if opts.CopilotWorkers > 0 {
+			required[config.AgentCopilot] = true
+		}
+		if opts.GeminiWorkers > 0 {
+			required[config.AgentGemini] = true
+		}
+		required[opts.Supervisor] = true
+		required[opts.PrepAgent] = true
 	}
-	if opts.CodexWorkers > 0 {
-		required[config.AgentCodex] = true
-	}
-	if opts.CopilotWorkers > 0 {
-		required[config.AgentCopilot] = true
-	}
-	if opts.GeminiWorkers > 0 {
-		required[config.AgentGemini] = true
-	}
-	required[opts.Supervisor] = true
-	required[opts.PrepAgent] = true
 
 	missing := []string{}
 	for _, st := range statuses {

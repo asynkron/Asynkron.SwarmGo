@@ -16,6 +16,7 @@ import (
 	"github.com/asynkron/Asynkron.SwarmGo/internal/events"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/prompts"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/session"
+	"github.com/asynkron/Asynkron.SwarmGo/internal/status"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/supervisor"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/worktree"
 )
@@ -38,6 +39,7 @@ type Orchestrator struct {
 	supervisorSpec  *supervisorSpec
 	userSpec        *userCommandSpec
 	agentRestarts   map[string]int
+	collectors      map[string]context.CancelFunc
 }
 
 // New constructs a new Orchestrator.
@@ -50,6 +52,7 @@ func New(sess *session.Session, opts config.Options, resume bool, events chan<- 
 		control:       control,
 		workerSpecs:   make(map[string]workerSpec),
 		agentRestarts: make(map[string]int),
+		collectors:    make(map[string]context.CancelFunc),
 	}
 }
 
@@ -66,6 +69,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		if o.codedSupervisor != nil {
 			o.codedSupervisor.Close()
 		}
+		o.stopAllCollectors()
 	}()
 
 	if log, err := newAppLogger(o.session.AppLogPath(), o.events); err == nil {
@@ -86,7 +90,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	o.emit(events.StatusMessage{Message: fmt.Sprintf("Session: %s", o.session.ID)})
 	o.emit(events.StatusMessage{Message: fmt.Sprintf("Repository: %s", o.opts.Repo)})
-	o.emit(events.StatusMessage{Message: fmt.Sprintf("Workers: Claude %d, Codex %d, Copilot %d, Gemini %d", o.opts.ClaudeWorkers, o.opts.CodexWorkers, o.opts.CopilotWorkers, o.opts.GeminiWorkers)})
+	if o.opts.AgentMode {
+		o.emit(events.StatusMessage{Message: fmt.Sprintf("Agent mode: %s", strings.Title(string(o.opts.AgentType)))})
+	} else {
+		o.emit(events.StatusMessage{Message: fmt.Sprintf("Workers: Claude %d, Codex %d, Copilot %d, Gemini %d", o.opts.ClaudeWorkers, o.opts.CodexWorkers, o.opts.CopilotWorkers, o.opts.GeminiWorkers)})
+	}
 	if o.resume {
 		o.logf("resuming session %s", o.session.ID)
 	} else {
@@ -95,6 +103,10 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	// Prime todo content
 	o.loadTodo()
+
+	if o.opts.AgentMode {
+		return o.runAgentMode(ctx)
+	}
 
 	restartCount := 0
 	if o.resume {
@@ -234,6 +246,95 @@ loop:
 	return nil
 }
 
+func (o *Orchestrator) runAgentMode(ctx context.Context) error {
+	restartCount := 0
+	if o.resume {
+		restartCount = 1
+	}
+
+	if o.resume {
+		o.emit(events.PhaseChanged{Phase: "Resuming agent..."})
+		o.logf("resuming single agent")
+	} else {
+		o.emit(events.PhaseChanged{Phase: "Starting agent..."})
+		o.logf("starting single agent")
+	}
+
+	ghAvailable := checkGhAvailable()
+	isGitHubRepo := checkGitHubRepo(o.opts.Repo)
+	logPath := o.session.WorkerLogPath(1)
+	cli := agents.NewCLI(o.opts.AgentType)
+	_, display := cli.Model(0)
+
+	o.emit(events.AgentAdded{
+		ID:       "worker-1",
+		Name:     "Agent",
+		Kind:     cli.Name(),
+		Model:    display,
+		LogPath:  logPath,
+		Worktree: o.opts.Repo,
+		Running:  true,
+	})
+
+	worker := agents.NewWorker(0, o.opts.Repo, o.opts.Todo, cli, logPath, false, "", restartCount, ghAvailable, isGitHubRepo, o.events)
+	if err := worker.Start(ctx); err != nil {
+		return fmt.Errorf("start agent: %w", err)
+	}
+	go o.trackCompletion(1, worker)
+	o.workerSpecs["worker-1"] = workerSpec{
+		index:        0,
+		worktree:     o.opts.Repo,
+		todoFile:     o.opts.Todo,
+		cli:          cli,
+		logPath:      logPath,
+		autopilot:    false,
+		branchName:   "",
+		ghAvailable:  ghAvailable,
+		isGitHubRepo: isGitHubRepo,
+	}
+	o.agentRestarts["worker-1"] = restartCount
+	o.track(worker)
+	o.startCollector(ctx, "worker-1", o.opts.Repo, logPath, cli)
+	if restartCount > 0 {
+		o.emit(events.StatusMessage{Message: fmt.Sprintf("Resumed agent (%s)", cli.Name())})
+	} else {
+		o.emit(events.StatusMessage{Message: fmt.Sprintf("Started agent (%s)", cli.Name())})
+	}
+	o.emit(events.PhaseChanged{Phase: "Agent running..."})
+
+	deadline := time.Now().Add(o.opts.Duration())
+	timeout := time.NewTimer(o.opts.Duration())
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	defer timeout.Stop()
+
+	for {
+		select {
+		case cmd := <-o.control:
+			if err := o.handleControl(ctx, cmd); err != nil {
+				o.emit(events.StatusMessage{Message: fmt.Sprintf("control error: %v", err)})
+			}
+		case <-ctx.Done():
+			o.emit(events.StatusMessage{Message: "Cancellation requested, stopping agent..."})
+			o.stopAll()
+			return ctx.Err()
+		case <-timeout.C:
+			o.emit(events.StatusMessage{Message: "Time limit reached, stopping agent..."})
+			o.emit(events.PhaseChanged{Phase: "Stopping agent..."})
+			worker.Stop()
+			o.emit(events.RemainingTime{Duration: 0})
+			o.emit(events.PhaseChanged{Phase: "Agent finished"})
+			return nil
+		case <-ticker.C:
+			remaining := time.Until(deadline)
+			if remaining < 0 {
+				remaining = 0
+			}
+			o.emit(events.RemainingTime{Duration: remaining})
+		}
+	}
+}
+
 func (o *Orchestrator) startWorkers(ctx context.Context, worktrees []string, workerTypes []config.AgentType, ghAvailable bool, isGitHubRepo bool, restartCount int) ([]*agents.Agent, []string, []config.AgentType, error) {
 	var workers []*agents.Agent
 	var logs []string
@@ -307,6 +408,7 @@ func (o *Orchestrator) startWorkers(ctx context.Context, worktrees []string, wor
 		workers = append(workers, worker)
 		logs = append(logs, logPath)
 		o.track(worker)
+		o.startCollector(ctx, fmt.Sprintf("worker-%d", workerNum), worktrees[i], logPath, cli)
 		if restartCount > 0 {
 			o.emit(events.StatusMessage{Message: fmt.Sprintf("Resumed %s (%s) -> %s", worker.Name, cli.Name(), worktrees[i])})
 			o.logf("resumed %s (%s) -> %s (log: %s; previously complete=%v)", worker.Name, cli.Name(), worktrees[i], logPath, prevComplete)
@@ -348,6 +450,7 @@ func (o *Orchestrator) startSupervisor(ctx context.Context, worktrees, workerLog
 	}
 
 	o.track(supervisor)
+	o.startCollector(ctx, "supervisor", o.opts.Repo, o.session.SupervisorLogPath(), cli)
 	o.emit(events.StatusMessage{Message: fmt.Sprintf("Started supervisor (%s)", cli.Name())})
 	o.logf("supervisor started")
 	o.supervisorSpec = &supervisorSpec{
@@ -374,6 +477,52 @@ func (o *Orchestrator) stopAll() {
 	for _, a := range o.agents {
 		a.Stop()
 	}
+}
+
+func (o *Orchestrator) stopAllCollectors() {
+	for id := range o.collectors {
+		o.stopCollector(id)
+	}
+}
+
+func (o *Orchestrator) stopCollector(id string) {
+	if cancel, ok := o.collectors[id]; ok {
+		cancel()
+		delete(o.collectors, id)
+	}
+}
+
+func (o *Orchestrator) startCollector(ctx context.Context, id, worktree, logPath string, cli agents.CLI) {
+	o.stopCollector(id)
+	cctx, cancel := context.WithCancel(ctx)
+	o.collectors[id] = cancel
+	coll := status.NewCollector(worktree, logPath, cli, o.session.Created, 5*time.Second)
+	go coll.Start(cctx, func(s status.Snapshot) {
+		o.emit(events.AgentStatus{ID: id, Snapshot: convertStatusSnapshot(s)})
+	})
+}
+
+func convertStatusSnapshot(s status.Snapshot) events.StatusSnapshot {
+	out := events.StatusSnapshot{
+		Branch:        s.Branch,
+		Untracked:     append([]string(nil), s.Untracked...),
+		RecentCommits: append([]string(nil), s.RecentCommits...),
+		Error:         s.Error,
+		UpdatedAt:     s.UpdatedAt,
+	}
+	for _, fc := range s.Staged {
+		out.Staged = append(out.Staged, events.StatusFileChange{Added: fc.Added, Deleted: fc.Deleted, File: fc.File})
+	}
+	for _, fc := range s.Unstaged {
+		out.Unstaged = append(out.Unstaged, events.StatusFileChange{Added: fc.Added, Deleted: fc.Deleted, File: fc.File})
+	}
+	if s.LastPass != nil {
+		out.LastPass = &events.StatusLogEvent{Timestamp: s.LastPass.Timestamp, Kind: s.LastPass.Kind, Message: s.LastPass.Message}
+	}
+	if s.LastFail != nil {
+		out.LastFail = &events.StatusLogEvent{Timestamp: s.LastFail.Timestamp, Kind: s.LastFail.Kind, Message: s.LastFail.Message}
+	}
+	return out
 }
 
 func (o *Orchestrator) logf(format string, args ...any) {
@@ -405,6 +554,7 @@ func (o *Orchestrator) handleControl(ctx context.Context, cmd control.Command) e
 
 func (o *Orchestrator) restartAgent(ctx context.Context, id string, message string) error {
 	o.logf("control: restarting %s with injected message length=%d", id, len(message))
+	o.stopCollector(id)
 	o.mu.Lock()
 	var target *agents.Agent
 	var remaining []*agents.Agent
@@ -439,6 +589,7 @@ func (o *Orchestrator) restartAgent(ctx context.Context, id string, message stri
 
 func (o *Orchestrator) stopAgent(id string) error {
 	o.logf("control: stopping %s", id)
+	o.stopCollector(id)
 	o.mu.Lock()
 	var target *agents.Agent
 	for _, a := range o.agents {
@@ -722,6 +873,7 @@ func (o *Orchestrator) restartWorker(ctx context.Context, id string, spec worker
 	o.agents = append(o.agents, worker)
 	o.agentRestarts[id] = restartCount
 	o.mu.Unlock()
+	o.startCollector(ctx, id, spec.worktree, spec.logPath, spec.cli)
 	o.logf("restarted %s (restartCount=%d)", id, restartCount)
 	o.emit(events.StatusMessage{Message: fmt.Sprintf("Restarted %s with injected note", id)})
 	return nil
@@ -761,6 +913,7 @@ func (o *Orchestrator) restartSupervisor(ctx context.Context, id string, message
 	o.agents = append(o.agents, sup)
 	o.agentRestarts[id] = restartCount
 	o.mu.Unlock()
+	o.startCollector(ctx, id, spec.repoPath, spec.logPath, spec.cli)
 	o.logf("restarted supervisor (restartCount=%d)", restartCount)
 	o.emit(events.StatusMessage{Message: "Restarted supervisor with injected note"})
 	return nil
@@ -779,6 +932,7 @@ func (o *Orchestrator) restartUserCommand(ctx context.Context, id string, messag
 	o.agents = append(o.agents, agent)
 	o.agentRestarts[id] = startCount
 	o.mu.Unlock()
+	o.startCollector(ctx, id, o.userSpec.repoPath, o.userSpec.logPath, o.userSpec.cli)
 	o.logf("started user command (starts=%d messageLen=%d)", startCount, len(message))
 	if strings.TrimSpace(message) == "" {
 		o.emit(events.StatusMessage{Message: "Started user command agent"})

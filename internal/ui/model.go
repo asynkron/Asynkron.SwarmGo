@@ -40,6 +40,7 @@ type Model struct {
 	itemOrder    []string // "session", "todo", agent IDs
 	agents       map[string]*agentView
 	logs         map[string]*logBuffer
+	statuses     map[string]events.StatusSnapshot
 	todoPath     string
 	todo         string
 	view         viewport.Model
@@ -112,7 +113,7 @@ type logEntry struct {
 }
 
 // New returns a ready-to-run UI model.
-func New(sess *session.Session, opts config.Options, events <-chan events.Event, control chan<- control.Command) Model {
+func New(sess *session.Session, opts config.Options, eventCh <-chan events.Event, control chan<- control.Command) Model {
 	view := viewport.New(80, 20)
 	view.MouseWheelEnabled = true
 	theme := defaultTheme()
@@ -132,10 +133,11 @@ func New(sess *session.Session, opts config.Options, events <-chan events.Event,
 	m := Model{
 		session:      sess,
 		opts:         opts,
-		events:       events,
+		events:       eventCh,
 		itemOrder:    []string{"session", "todo", "coded"},
 		agents:       make(map[string]*agentView),
 		logs:         make(map[string]*logBuffer),
+		statuses:     make(map[string]events.StatusSnapshot),
 		view:         view,
 		styles:       theme,
 		mouseEnabled: true,
@@ -356,6 +358,7 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 	case events.AgentRemoved:
 		delete(m.agents, e.ID)
 		delete(m.logs, e.ID)
+		delete(m.statuses, e.ID)
 		m.rebuildOrder()
 		m.updateViewport()
 	case events.AgentStopped:
@@ -364,6 +367,9 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 			ag.ExitCode = e.ExitCode
 		}
 		m.status = append(m.status, fmt.Sprintf("%s exited (%d)", e.ID, e.ExitCode))
+	case events.AgentStatus:
+		m.statuses[e.ID] = e.Snapshot
+		m.updateViewport()
 	case events.AgentLine:
 		if ag, ok := m.agents[e.ID]; ok {
 			ag.Spinner = (ag.Spinner + 1) % len(spinnerFrames)
@@ -601,33 +607,16 @@ func (m Model) renderRow(name, meta string, selected bool, prefix string) string
 }
 
 func (m *Model) renderWorkerSummary(id string) string {
-	if !strings.HasPrefix(id, "worker-") {
+	snap, ok := m.snapshotFor(id)
+	if !ok {
 		return ""
 	}
-	var workerNum int
-	if _, err := fmt.Sscanf(id, "worker-%d", &workerNum); err != nil {
-		return ""
-	}
-	snap := m.loadCodedSnapshot()
-	if snap == nil {
-		return ""
-	}
-	var ws *codedWorker
-	for i := range snap.Workers {
-		if snap.Workers[i].WorkerNumber == workerNum {
-			ws = &snap.Workers[i]
-			break
-		}
-	}
-	if ws == nil {
-		return ""
-	}
-
+	git := snapshotToCoded(*snap)
 	parts := make([]string, 0, 2)
-	if ws.Git.Branch != "" {
-		parts = append(parts, fmt.Sprintf("Branch: %s", ws.Git.Branch))
+	if git.Branch != "" {
+		parts = append(parts, fmt.Sprintf("Branch: %s", git.Branch))
 	}
-	if counts := summarizeCounts(ws.Git); counts != "" {
+	if counts := summarizeCounts(git); counts != "" {
 		parts = append(parts, counts)
 	}
 	if len(parts) == 0 {
@@ -637,29 +626,12 @@ func (m *Model) renderWorkerSummary(id string) string {
 }
 
 func (m *Model) renderWorkerFiles(id string) string {
-	if !strings.HasPrefix(id, "worker-") {
+	snap, ok := m.snapshotFor(id)
+	if !ok {
 		return ""
 	}
-	var workerNum int
-	if _, err := fmt.Sscanf(id, "worker-%d", &workerNum); err != nil {
-		return ""
-	}
-	snap := m.loadCodedSnapshot()
-	if snap == nil {
-		return ""
-	}
-	var ws *codedWorker
-	for i := range snap.Workers {
-		if snap.Workers[i].WorkerNumber == workerNum {
-			ws = &snap.Workers[i]
-			break
-		}
-	}
-	if ws == nil {
-		return ""
-	}
-
-	lines := summarizeFileLines(ws.Git.Staged, ws.Git.Unstaged, ws.Git.Untracked, 4)
+	git := snapshotToCoded(*snap)
+	lines := summarizeFileLines(git.Staged, git.Unstaged, git.Untracked, 4)
 	if len(lines) == 0 {
 		return ""
 	}
@@ -667,6 +639,29 @@ func (m *Model) renderWorkerFiles(id string) string {
 		lines[i] = "    " + lines[i]
 	}
 	return lipgloss.NewStyle().Foreground(m.styles.dim).Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) snapshotFor(id string) (*events.StatusSnapshot, bool) {
+	if snap, ok := m.statuses[id]; ok {
+		return &snap, true
+	}
+	if strings.HasPrefix(id, "worker-") {
+		var workerNum int
+		if _, err := fmt.Sscanf(id, "worker-%d", &workerNum); err != nil {
+			return nil, false
+		}
+		snap := m.loadCodedSnapshot()
+		if snap == nil {
+			return nil, false
+		}
+		for _, w := range snap.Workers {
+			if w.WorkerNumber == workerNum {
+				converted := convertCodedSnapshot(w)
+				return &converted, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (m Model) renderLog() string {
@@ -828,6 +823,9 @@ func (m *Model) loadCodedSnapshot() *codedSnapshot {
 }
 
 func (m *Model) renderMetrics() string {
+	if len(m.statuses) > 0 {
+		return m.renderMetricsFromStatuses()
+	}
 	path := m.session.CodedSupervisorPath()
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -888,6 +886,82 @@ func (m *Model) renderMetrics() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (m *Model) renderMetricsFromStatuses() string {
+	if len(m.statuses) == 0 {
+		return "no metrics yet"
+	}
+	type entry struct {
+		id   string
+		name string
+		snap events.StatusSnapshot
+	}
+	entries := make([]entry, 0, len(m.statuses))
+	for id, snap := range m.statuses {
+		name := id
+		if ag, ok := m.agents[id]; ok {
+			name = ag.Name
+		}
+		entries = append(entries, entry{id: id, name: name, snap: snap})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+	var b strings.Builder
+	// Use the latest snapshot time for the header.
+	var latest time.Time
+	for _, e := range entries {
+		if e.snap.UpdatedAt.After(latest) {
+			latest = e.snap.UpdatedAt
+		}
+	}
+	if !latest.IsZero() {
+		fmt.Fprintf(&b, "Updated: %s\n\n", latest.Format("15:04:05"))
+	}
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%s\n", e.name)
+		git := snapshotToCoded(e.snap)
+		if git.Error != "" {
+			fmt.Fprintf(&b, "  Git error: %s\n\n", git.Error)
+			continue
+		}
+		if git.Branch != "" {
+			fmt.Fprintf(&b, "  Branch: %s\n", git.Branch)
+		}
+		writeChanges := func(title string, list []fileChange) {
+			if len(list) == 0 {
+				return
+			}
+			fmt.Fprintf(&b, "  %s:\n", title)
+			for _, fc := range list {
+				fmt.Fprintf(&b, "    * %s  +%d -%d\n", fc.File, fc.Added, fc.Deleted)
+			}
+		}
+		writeChanges("Staged", git.Staged)
+		writeChanges("Unstaged", git.Unstaged)
+		if len(git.Untracked) > 0 {
+			fmt.Fprintf(&b, "  Untracked:\n")
+			for _, f := range git.Untracked {
+				fmt.Fprintf(&b, "    * %s\n", f)
+			}
+		}
+		if len(git.RecentCommits) > 0 {
+			fmt.Fprintf(&b, "  Recent commits:\n")
+			for _, c := range git.RecentCommits {
+				fmt.Fprintf(&b, "    * %s\n", c)
+			}
+		}
+		if e.snap.LastPass != nil || e.snap.LastFail != nil {
+			fmt.Fprintf(&b, "  Tests:\n")
+			if e.snap.LastPass != nil {
+				fmt.Fprintf(&b, "    last pass: %s\n", e.snap.LastPass.Message)
+			}
+			if e.snap.LastFail != nil {
+				fmt.Fprintf(&b, "    last fail: %s\n", e.snap.LastFail.Message)
+			}
+		}
+		fmt.Fprintln(&b)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 type codedSnapshot struct {
 	UpdatedAt time.Time     `json:"updatedAt"`
 	Workers   []codedWorker `json:"workers"`
@@ -925,6 +999,52 @@ type codedLogEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	Kind      string    `json:"kind"`
 	Message   string    `json:"message"`
+}
+
+func convertCodedSnapshot(w codedWorker) events.StatusSnapshot {
+	s := events.StatusSnapshot{
+		Branch:        w.Git.Branch,
+		Staged:        convertToStatusChanges(w.Git.Staged),
+		Unstaged:      convertToStatusChanges(w.Git.Unstaged),
+		Untracked:     append([]string(nil), w.Git.Untracked...),
+		RecentCommits: append([]string(nil), w.Git.RecentCommits...),
+		Error:         w.Git.Error,
+		UpdatedAt:     w.LastUpdated,
+	}
+	if w.Logs.LastPass != nil {
+		s.LastPass = &events.StatusLogEvent{Timestamp: w.Logs.LastPass.Timestamp, Kind: w.Logs.LastPass.Kind, Message: w.Logs.LastPass.Message}
+	}
+	if w.Logs.LastFail != nil {
+		s.LastFail = &events.StatusLogEvent{Timestamp: w.Logs.LastFail.Timestamp, Kind: w.Logs.LastFail.Kind, Message: w.Logs.LastFail.Message}
+	}
+	return s
+}
+
+func snapshotToCoded(s events.StatusSnapshot) codedGit {
+	return codedGit{
+		Branch:        s.Branch,
+		Staged:        convertChanges(s.Staged),
+		Unstaged:      convertChanges(s.Unstaged),
+		Untracked:     append([]string(nil), s.Untracked...),
+		RecentCommits: append([]string(nil), s.RecentCommits...),
+		Error:         s.Error,
+	}
+}
+
+func convertChanges(in []events.StatusFileChange) []fileChange {
+	out := make([]fileChange, 0, len(in))
+	for _, fc := range in {
+		out = append(out, fileChange{Added: fc.Added, Deleted: fc.Deleted, File: fc.File})
+	}
+	return out
+}
+
+func convertToStatusChanges(in []fileChange) []events.StatusFileChange {
+	out := make([]events.StatusFileChange, 0, len(in))
+	for _, fc := range in {
+		out = append(out, events.StatusFileChange{Added: fc.Added, Deleted: fc.Deleted, File: fc.File})
+	}
+	return out
 }
 
 func summarizeCounts(g codedGit) string {

@@ -77,6 +77,10 @@ type Agent struct {
 	Display string
 	CLI     CLI
 	Events  chan<- Event
+	// DisablePreamble omits the startup/prompt preamble from the log.
+	DisablePreamble bool
+	// InlineParse parses stdout/stderr directly instead of tailing the log file.
+	InlineParse bool
 
 	cmd        *exec.Cmd
 	logFile    *os.File
@@ -107,18 +111,22 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 	a.logFile = logFile
 
-	if info, err := logFile.Stat(); err == nil && info.Size() > 0 {
-		_, _ = fmt.Fprintln(a.logFile)
-	}
+	if !a.DisablePreamble {
+		if info, err := logFile.Stat(); err == nil && info.Size() > 0 {
+			_, _ = fmt.Fprintln(a.logFile)
+		}
 
-	_, _ = fmt.Fprintf(a.logFile, "[%s] %s starting\n", time.Now().Format(time.RFC3339), a.Name)
-	_, _ = fmt.Fprintf(a.logFile, "[%s] workdir: %s\n", time.Now().Format(time.RFC3339), a.Workdir)
+		_, _ = fmt.Fprintf(a.logFile, "[%s] %s starting\n", time.Now().Format(time.RFC3339), a.Name)
+		_, _ = fmt.Fprintf(a.logFile, "[%s] workdir: %s\n", time.Now().Format(time.RFC3339), a.Workdir)
+	}
 
 	args := a.CLI.BuildArgs(a.Prompt, a.Model)
 	cmd := exec.CommandContext(ctx, a.CLI.Command(), args...)
 	cmd.Dir = a.Workdir
 
-	_, _ = fmt.Fprintf(a.logFile, "[%s] command: %s %s\n\n", time.Now().Format(time.RFC3339), a.CLI.Command(), strings.Join(args, " "))
+	if !a.DisablePreamble {
+		_, _ = fmt.Fprintf(a.logFile, "[%s] command: %s %s\n\n", time.Now().Format(time.RFC3339), a.CLI.Command(), strings.Join(args, " "))
+	}
 
 	if a.CLI.UseStdin() {
 		stdin, err := cmd.StdinPipe()
@@ -161,11 +169,15 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	tailCtx, cancel := context.WithCancel(context.Background())
 	a.tailCancel = cancel
-	a.tailWG.Add(1)
-	go a.tailFile(tailCtx)
-
-	go a.stream(stdout)
-	go a.stream(stderr)
+	if a.InlineParse {
+		go a.parseStream(tailCtx, stdout)
+		go a.parseStream(tailCtx, stderr)
+	} else {
+		a.tailWG.Add(1)
+		go a.tailFile(tailCtx)
+		go a.stream(stdout)
+		go a.stream(stderr)
+	}
 	go a.wait(ctx)
 
 	return nil
@@ -192,6 +204,41 @@ func (a *Agent) stream(r io.Reader) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		_, _ = a.logFile.WriteString(line + "\n")
+	}
+}
+
+func (a *Agent) parseStream(ctx context.Context, r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		line := scanner.Text()
+		if a.logFile != nil {
+			_, _ = a.logFile.WriteString(line + "\n")
+		}
+		clean := cleanLine(strings.TrimRight(line, "\r\n"))
+		if strings.TrimSpace(clean) == "" {
+			continue
+		}
+		msgs := a.CLI.Parse(clean)
+		if msgs == nil {
+			continue
+		}
+		for _, msg := range msgs {
+			if msg.Kind == MessageSay {
+				a.emit(AgentLine{ID: a.ID, Kind: msg.Kind, Line: msg.Text})
+				continue
+			}
+			for _, p := range strings.Split(msg.Text, "\n") {
+				if strings.TrimRight(p, " \t\r") == "" {
+					continue
+				}
+				a.emit(AgentLine{ID: a.ID, Kind: msg.Kind, Line: p})
+			}
+		}
 	}
 }
 

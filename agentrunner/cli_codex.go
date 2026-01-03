@@ -33,7 +33,7 @@ func (c *codexCLI) Parse(line string) []ParsedMessage {
 	switch trim {
 	case "thinking":
 		c.doMode = false
-		return []ParsedMessage{{Kind: MessageSay, Text: "[thinking]"}}
+		return []ParsedMessage{{Kind: MessageSay, Text: ""}}
 	case "exec":
 		c.doMode = true
 		return []ParsedMessage{{Kind: MessageDo, Text: "[exec]"}}

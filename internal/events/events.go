@@ -49,6 +49,39 @@ type CompletedWorker struct {
 	LogPath string
 }
 
+// AgentStatus carries git/log snapshot updates for an agent.
+type AgentStatus struct {
+	ID       string
+	Snapshot StatusSnapshot
+}
+
+// StatusSnapshot is a lightweight git/log view used by the UI.
+type StatusSnapshot struct {
+	Branch        string             `json:"branch"`
+	Staged        []StatusFileChange `json:"staged"`
+	Unstaged      []StatusFileChange `json:"unstaged"`
+	Untracked     []string           `json:"untracked"`
+	RecentCommits []string           `json:"recentCommits"`
+	Error         string             `json:"error,omitempty"`
+	LastPass      *StatusLogEvent    `json:"lastPass,omitempty"`
+	LastFail      *StatusLogEvent    `json:"lastFail,omitempty"`
+	UpdatedAt     time.Time          `json:"updatedAt"`
+}
+
+// StatusFileChange mirrors git numstat output.
+type StatusFileChange struct {
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
+	File    string `json:"file"`
+}
+
+// StatusLogEvent captures simple pass/fail signals from logs.
+type StatusLogEvent struct {
+	Timestamp time.Time `json:"timestamp"`
+	Kind      string    `json:"kind"`
+	Message   string    `json:"message"`
+}
+
 // AgentMessageKind mirrors Say/Do/See categories from the original UI.
 type AgentMessageKind int
 
@@ -68,3 +101,4 @@ func (RoundChanged) isEvent()    {}
 func (RemainingTime) isEvent()   {}
 func (TodoLoaded) isEvent()      {}
 func (CompletedWorker) isEvent() {}
+func (AgentStatus) isEvent()     {}
