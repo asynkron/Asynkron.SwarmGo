@@ -18,6 +18,7 @@ import (
 	"github.com/asynkron/Asynkron.SwarmGo/internal/orchestrator"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/session"
 	"github.com/asynkron/Asynkron.SwarmGo/internal/ui"
+	"github.com/asynkron/Asynkron.SwarmGo/internal/viewer"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -26,6 +27,11 @@ func main() {
 
 	if opts.Detect {
 		runDetect()
+		return
+	}
+
+	if opts.ViewMode {
+		runViewMode(opts)
 		return
 	}
 
@@ -139,6 +145,7 @@ func parseFlags() (config.Options, string, string, int, bool) {
 	flag.StringVar(&prepAgent, "prep-agent", "claude", "agent type for prep (claude|codex|copilot|gemini)")
 	flag.BoolVar(&opts.AgentMode, "agent", false, "run a single agent directly in the repo (no prep/supervisor)")
 	flag.StringVar(&agentType, "agent-type", "codex", "agent type for --agent mode (claude|codex|copilot|gemini)")
+	flag.BoolVar(&opts.ViewMode, "view", false, "view-only mode: browse external Claude agent logs")
 
 	flag.Parse()
 
@@ -249,4 +256,43 @@ func title(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func runViewMode(opts config.Options) {
+	if err := opts.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	eventCh := make(chan events.Event, 512)
+	ctrlCh := make(chan control.Command, 16)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	v := viewer.New(opts.Repo, eventCh)
+
+	fmt.Printf("View mode: watching %s\n", v.TasksDir())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := v.Run(ctx); err != nil && ctx.Err() == nil {
+			eventCh <- events.StatusMessage{Message: fmt.Sprintf("viewer error: %v", err)}
+		}
+		close(eventCh)
+	}()
+
+	program := tea.NewProgram(
+		ui.New(nil, opts, eventCh, ctrlCh),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		tea.WithContext(ctx),
+	)
+	if _, err := program.Run(); err != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "ui error: %v\n", err)
+	}
+
+	cancel()
+	wg.Wait()
 }

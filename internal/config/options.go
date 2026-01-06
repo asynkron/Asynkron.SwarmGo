@@ -29,6 +29,7 @@ type Options struct {
 	Resume     string
 	Detect     bool
 	SkipDetect bool
+	ViewMode   bool
 }
 
 // AgentType matches supported CLI agent executables.
@@ -46,6 +47,11 @@ func (o *Options) Validate() error {
 	if o.Detect {
 		// Skip all other validation; detection runs without needing repo/todo.
 		return nil
+	}
+
+	// View mode only needs repo path, not todo or workers.
+	if o.ViewMode {
+		return o.validateRepo()
 	}
 
 	if o.ClaudeWorkers < 0 || o.CodexWorkers < 0 || o.CopilotWorkers < 0 || o.GeminiWorkers < 0 {
@@ -76,6 +82,23 @@ func (o *Options) Validate() error {
 		o.PrepAgent = AgentClaude
 	}
 
+	if err := o.validateRepo(); err != nil {
+		return err
+	}
+
+	if o.Todo == "" {
+		o.Todo = "todo.md"
+	}
+	todoPath := filepath.Join(o.Repo, o.Todo)
+	if _, err := os.Stat(todoPath); err != nil {
+		return fmt.Errorf("todo file not found: %s", todoPath)
+	}
+
+	return nil
+}
+
+// validateRepo resolves and validates the repository path.
+func (o *Options) validateRepo() error {
 	if o.Repo == "" {
 		root, err := findGitRoot()
 		if err != nil {
@@ -98,14 +121,6 @@ func (o *Options) Validate() error {
 	gitDir := filepath.Join(o.Repo, ".git")
 	if _, err := os.Stat(gitDir); err != nil {
 		return fmt.Errorf("not a git repository: %s", o.Repo)
-	}
-
-	if o.Todo == "" {
-		o.Todo = "todo.md"
-	}
-	todoPath := filepath.Join(o.Repo, o.Todo)
-	if _, err := os.Stat(todoPath); err != nil {
-		return fmt.Errorf("todo file not found: %s", todoPath)
 	}
 
 	return nil

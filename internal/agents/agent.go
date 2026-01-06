@@ -255,7 +255,7 @@ func (a *Agent) tailFile(ctx context.Context) {
 			line, err := reader.ReadString('\n')
 			if line != "" {
 				trimmed := strings.TrimRight(line, "\r\n")
-				clean := cleanLine(trimmed)
+				clean := CleanLine(trimmed)
 				if strings.TrimSpace(clean) == "" {
 					continue
 				}
@@ -308,7 +308,8 @@ func (a *Agent) tailFile(ctx context.Context) {
 
 var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
-func cleanLine(input string) string {
+// CleanLine removes ANSI escape codes and control characters from a log line.
+func CleanLine(input string) string {
 	stripped := ansiRegexp.ReplaceAllString(input, "")
 	var b strings.Builder
 	for _, r := range stripped {

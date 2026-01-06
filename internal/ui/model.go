@@ -65,14 +65,16 @@ type Model struct {
 }
 
 type agentView struct {
-	ID       string
-	Name     string
-	Kind     string
-	Model    string
-	LogPath  string
-	Running  bool
-	ExitCode int
-	Spinner  int
+	ID        string
+	Name      string
+	Kind      string
+	Model     string
+	LogPath   string
+	Running   bool
+	ExitCode  int
+	Spinner   int
+	Completed int // todo progress
+	Total     int // todo progress
 }
 
 type logBuffer struct {
@@ -130,18 +132,26 @@ func New(sess *session.Session, opts config.Options, eventCh <-chan events.Event
 	ti.ShowLineNumbers = false
 	ti.Focus()
 
+	// In view mode, start with empty sidebar (no session/todo/coded)
+	initialItems := []string{"session", "todo", "coded"}
+	hasCoded := true
+	if opts.ViewMode {
+		initialItems = []string{}
+		hasCoded = false
+	}
+
 	m := Model{
 		session:      sess,
 		opts:         opts,
 		events:       eventCh,
-		itemOrder:    []string{"session", "todo", "coded"},
+		itemOrder:    initialItems,
 		agents:       make(map[string]*agentView),
 		logs:         make(map[string]*logBuffer),
 		statuses:     make(map[string]events.StatusSnapshot),
 		view:         view,
 		styles:       theme,
 		mouseEnabled: true,
-		hasCoded:     true,
+		hasCoded:     hasCoded,
 		spinner:      sp,
 		control:      control,
 		inputField:   ti,
@@ -184,25 +194,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selected > 0 {
 					m.selected--
 					m.updateViewport()
+					if m.isLogSelection() {
+						m.gotoBottom()
+					}
 				}
 				skipViewport = true
 			} else {
 				m.view.LineUp(3)
 				skipViewport = true
 			}
-			m.followTail = m.view.AtBottom()
 		case tea.MouseWheelDown:
 			if msg.X <= m.listWidth {
 				if m.selected < len(m.itemOrder)-1 {
 					m.selected++
 					m.updateViewport()
+					if m.isLogSelection() {
+						m.gotoBottom()
+					}
 				}
 				skipViewport = true
 			} else {
 				m.view.LineDown(3)
 				skipViewport = true
 			}
-			m.followTail = m.view.AtBottom()
 		case tea.MouseMotion:
 			// update hover only
 			skipViewport = true
@@ -241,13 +255,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
-				m.followTail = m.isLogSelection()
+				m.updateViewport()
+				if m.isLogSelection() {
+					m.gotoBottom()
+				}
 				skipViewport = true
 			}
 		case "down", "j":
 			if m.selected < len(m.itemOrder)-1 {
 				m.selected++
-				m.followTail = m.isLogSelection()
+				m.updateViewport()
+				if m.isLogSelection() {
+					m.gotoBottom()
+				}
 				skipViewport = true
 			}
 		case "pgup":
@@ -367,6 +387,11 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 			ag.ExitCode = e.ExitCode
 		}
 		m.status = append(m.status, fmt.Sprintf("%s exited (%d)", e.ID, e.ExitCode))
+	case events.AgentProgress:
+		if ag, ok := m.agents[e.ID]; ok {
+			ag.Completed = e.Completed
+			ag.Total = e.Total
+		}
 	case events.AgentStatus:
 		m.statuses[e.ID] = e.Snapshot
 		m.updateViewport()
@@ -377,9 +402,8 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 		buf := m.ensureLog(e.ID)
 		kind := e.Kind
 		selected := m.selected < len(m.itemOrder) && m.itemOrder[m.selected] == e.ID
-		if selected && !m.view.AtBottom() {
-			m.followTail = false
-		}
+		// Check if at bottom BEFORE adding new content
+		wasAtBottom := m.view.AtBottom()
 		if ag, ok := m.agents[e.ID]; ok && ag.Kind == "Codex" {
 			switch strings.TrimSpace(e.Line) {
 			case "[exec]":
@@ -392,11 +416,12 @@ func (m *Model) handleEvent(ev events.Event) (Model, tea.Cmd) {
 			}
 		}
 		trimmed := buf.append(logEntry{Kind: kind, Text: e.Line})
-		if trimmed && m.selected < len(m.itemOrder) && m.itemOrder[m.selected] == e.ID {
+		if trimmed && selected {
 			m.clampViewport()
 		}
-		if selected && !m.mouseOverLog && m.followTail {
-			m.view.GotoBottom()
+		// Only scroll to bottom if we were already at bottom
+		if selected && wasAtBottom {
+			m.gotoBottom()
 		}
 		if c := m.requestViewportUpdate(); c != nil {
 			return *m, c
@@ -488,18 +513,19 @@ func (m *Model) updateViewport() {
 		}
 	}
 	m.clampViewport()
-	// Always jump to bottom when switching selection to match log tail expectation.
-	if id != "session" && id != "todo" && id != "coded" {
-		m.view.GotoBottom()
-		m.followTail = true
-	}
 }
 
 func (m Model) renderHeader() string {
 	session := lipgloss.NewStyle().Bold(true).Foreground(m.styles.header).Render("SWARM")
-	id := lipgloss.NewStyle().Foreground(m.styles.dim).Render(m.session.ID)
+	sessionID := ""
+	if m.session != nil {
+		sessionID = m.session.ID
+	}
+	id := lipgloss.NewStyle().Foreground(m.styles.dim).Render(sessionID)
 	mode := ""
-	if m.opts.Arena {
+	if m.opts.ViewMode {
+		mode = lipgloss.NewStyle().Foreground(m.styles.accent).Render("View")
+	} else if m.opts.Arena {
 		mode = lipgloss.NewStyle().Foreground(m.styles.accent).Render("Arena")
 	} else if m.opts.Autopilot {
 		mode = lipgloss.NewStyle().Foreground(m.styles.accent).Render("Autopilot")
@@ -535,11 +561,19 @@ func (m Model) renderList() string {
 		}
 		switch id {
 		case "session":
-			rows = append(rows, m.renderRow("Session", m.session.ID, selected, ""))
+			sessionID := ""
+			if m.session != nil {
+				sessionID = m.session.ID
+			}
+			rows = append(rows, m.renderRow("Session", sessionID, selected, ""))
 		case "todo":
 			rows = append(rows, m.renderRow("Todo", m.opts.Todo, selected, ""))
 		case "coded":
-			rows = append(rows, m.renderRow("Metrics", filepath.Base(m.session.CodedSupervisorPath()), selected, ""))
+			codedPath := ""
+			if m.session != nil {
+				codedPath = filepath.Base(m.session.CodedSupervisorPath())
+			}
+			rows = append(rows, m.renderRow("Metrics", codedPath, selected, ""))
 		default:
 			ag := m.agents[id]
 			var state string
@@ -557,7 +591,13 @@ func (m Model) renderList() string {
 					state = lipgloss.NewStyle().Foreground(m.styles.error).Render("○")
 				}
 			}
-			meta := fmt.Sprintf("%s %s", ag.Kind, ag.Model)
+			// Build meta with progress bar if available
+			var meta string
+			if ag.Total > 0 {
+				meta = renderProgressBar(ag.Completed, ag.Total, 10)
+			} else {
+				meta = fmt.Sprintf("%s %s", ag.Kind, ag.Model)
+			}
 			rows = append(rows, m.renderRow(ag.Name, meta, selected, state))
 			if info := m.renderWorkerSummary(id); info != "" {
 				rows = append(rows, info)
@@ -694,6 +734,14 @@ func (m Model) renderLog() string {
 }
 
 func (m Model) renderSessionInfo() string {
+	if m.session == nil {
+		// View mode: show minimal info
+		lines := []string{
+			"Mode: View (read-only)",
+			fmt.Sprintf("Repository: %s", m.opts.Repo),
+		}
+		return strings.Join(lines, "\n")
+	}
 	lines := []string{
 		fmt.Sprintf("Session ID: %s", m.session.ID),
 		fmt.Sprintf("Path: %s", m.session.Path),
@@ -748,7 +796,7 @@ func (b *logBuffer) content() string {
 
 func (m *Model) todoFilePath() string {
 	path := m.todoPath
-	if path == "" {
+	if path == "" && m.session != nil {
 		path = filepath.Join(m.session.Path, m.opts.Todo)
 	}
 	if m.opts.Repo != "" {
@@ -793,6 +841,9 @@ func (m *Model) renderTodo() string {
 }
 
 func (m *Model) loadCodedSupervisor() string {
+	if m.session == nil {
+		return "No metrics in view mode"
+	}
 	path := m.session.CodedSupervisorPath()
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -802,6 +853,9 @@ func (m *Model) loadCodedSupervisor() string {
 }
 
 func (m *Model) loadCodedSnapshot() *codedSnapshot {
+	if m.session == nil {
+		return nil
+	}
 	path := m.session.CodedSupervisorPath()
 	info, err := os.Stat(path)
 	if err != nil {
@@ -1254,8 +1308,12 @@ func (m *Model) markDoBuffersDirty() {
 
 func (m *Model) clampViewport() {
 	if m.view.PastBottom() {
-		m.view.GotoBottom()
+		m.gotoBottom()
 	}
+}
+
+func (m *Model) gotoBottom() {
+	m.view.GotoBottom()
 }
 
 func (m Model) renderScrollbar(height int, percent float64) string {
@@ -1282,6 +1340,10 @@ func (m Model) renderScrollbar(height int, percent float64) string {
 }
 
 func (m *Model) startInjectPrompt() {
+	// View mode is read-only
+	if m.opts.ViewMode {
+		return
+	}
 	if m.inputActive {
 		return
 	}
@@ -1300,6 +1362,10 @@ func (m *Model) startInjectPrompt() {
 }
 
 func (m *Model) toggleAgent() {
+	// View mode is read-only
+	if m.opts.ViewMode {
+		return
+	}
 	if m.selected >= len(m.itemOrder) {
 		return
 	}
@@ -1345,4 +1411,22 @@ func title(s string) string {
 	}
 	runes[0] = unicode.ToUpper(runes[0])
 	return string(runes)
+}
+
+// renderProgressBar returns a compact progress bar like "█████░░░░░ 5/10"
+func renderProgressBar(completed, total, width int) string {
+	if total == 0 {
+		return ""
+	}
+	filled := (completed * width) / total
+	var sb strings.Builder
+	for i := 0; i < width; i++ {
+		if i < filled {
+			sb.WriteString("█")
+		} else {
+			sb.WriteString("░")
+		}
+	}
+	sb.WriteString(fmt.Sprintf(" %d/%d", completed, total))
+	return sb.String()
 }

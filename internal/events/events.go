@@ -22,6 +22,12 @@ type AgentStopped struct {
 	ExitCode int
 }
 
+type AgentProgress struct {
+	ID        string
+	Completed int
+	Total     int
+}
+
 type AgentLine struct {
 	ID   string
 	Kind AgentMessageKind
@@ -94,6 +100,7 @@ const (
 func (AgentAdded) isEvent()      {}
 func (AgentRemoved) isEvent()    {}
 func (AgentStopped) isEvent()    {}
+func (AgentProgress) isEvent()   {}
 func (AgentLine) isEvent()       {}
 func (StatusMessage) isEvent()   {}
 func (PhaseChanged) isEvent()    {}
